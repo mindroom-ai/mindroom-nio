@@ -567,7 +567,6 @@ async def test_subscription_replacement_retains_accepted_input_and_removes_stick
         await session.update_sliding_subscriptions(subscriptions)
         subscriptions[ROOM]["timeline_limit"] = 99
         assert session._store.input[0] == body
-        await session._prepare_pending()
         records = await settle(session)
         assert any(r.source.get("event_id") == "$accepted" for r in records)
         request = json.loads(session._sliding.request()[2])

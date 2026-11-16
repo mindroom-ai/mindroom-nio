@@ -624,7 +624,6 @@ async def test_committed_prologue_key_decrypts_history_after_restart(
     body = json.loads(limited())
     body["to_device"] = encrypted_sync["to_device"]
     await session._capture_response(json.dumps(body).encode())
-    await session._prepare_pending()
     assert session.cursor == "s1"
     assert session._store.input[1]["phase"] == "recover"
     assert any(
@@ -690,7 +689,6 @@ async def test_interrupted_transaction_restores_old_cursor_and_projection(
         session = open_session(tmp_path, nio_client)
         await baseline(session)
         await session._capture_response(limited())
-        await session._prepare_pending()
         original = (
             nio_client._iter_room_timeline
             if boundary == "page"

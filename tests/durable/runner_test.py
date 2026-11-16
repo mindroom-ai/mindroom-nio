@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 
 import pytest
 from aiohttp import web
@@ -298,19 +298,14 @@ async def test_empty_sync_commits_once_before_its_acknowledgement(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("held", [False, True])
-async def test_sync_preparation_leaves_crypto_requests_to_the_lock_holder(
+async def test_sync_preparation_retains_a_due_crypto_request_unless_the_lock_is_held(
     tmp_path, held
 ):
     session = open_session(tmp_path)
     try:
         # A new device's key upload is due after this otherwise empty sync.
-        if held:
-            await session._crypto_lock.acquire()
-        try:
+        async with session._crypto_lock if held else nullcontext():
             await session._accept_response(b'{"next_batch":"s1"}')
-        finally:
-            if held:
-                session._crypto_lock.release()
         pending = session._crypto._pending()
         assert (pending[0].kind if pending else None) == (None if held else "upload")
         # The sync stays incomplete until the runner's maintenance pass.

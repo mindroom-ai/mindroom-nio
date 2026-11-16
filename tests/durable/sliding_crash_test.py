@@ -198,7 +198,6 @@ async def test_expanded_window_promotes_ciphertext_before_processed_overlap(tmp_
         raw["rooms"][ROOM]["timeline"].insert(0, message("$ancient"))
         raw["extensions"]["to_device"]["events"] = keys
         await session._capture_response(json.dumps(raw).encode())
-        await session._prepare_pending()
         while batch := await session.next_batch():
             await session.ack(batch)
         # Equal window boundaries need no network page; finish the shared walker.
