@@ -214,8 +214,9 @@ class DurableSync:
             self._assert_active()
             if self._sliding is not None:
                 self._sliding.accepted_generation = generation
-            # Capture commits with preparation. A crash before that commit
-            # keeps the previous cursor, so the server repeats this response.
+            # Capture commits with preparation. Until that commit the previous
+            # cursor stays authoritative, so a failure or crash before it
+            # leaves this response's interval to be fetched again.
             await self._prepare_pending(
                 response,
                 new_input=(

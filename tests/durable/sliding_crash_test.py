@@ -112,6 +112,7 @@ async def test_sliding_key_and_message_recover_together_after_process_kill(
             assert session._store.input is None
             assert session._sliding.device_cursor is None
             await session._capture_response((tmp_path / "sliding.json").read_bytes())
+        await session._prepare_pending()
         records = []
         while batch := await session.next_batch():
             records.extend(batch.records)

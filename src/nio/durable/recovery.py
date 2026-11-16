@@ -470,8 +470,12 @@ class Recovery:
         await self.prepare()
         session = self.session
         state = session._store.continuation
-        assert state is not None
-        if session._store.has_batches() or state.get("phase") != "recover":
+        # Preparation may also have completed the sync and retired its input.
+        if (
+            state is None
+            or session._store.has_batches()
+            or state.get("phase") != "recover"
+        ):
             return
         room_id, info, section = self._candidates()[state["room_index"]]
         target = info.timeline.prev_batch
