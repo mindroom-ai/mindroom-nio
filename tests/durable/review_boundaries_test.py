@@ -57,7 +57,7 @@ async def test_encrypted_room_save_rolls_back_with_durable_preparation(
         assert ROOM not in reopened.client.store.load_encrypted_rooms()
         assert reopened.cursor is None
         assert await reopened.next_batch() is None
-        assert reopened._store.input[0] == body
+        assert reopened._store.input is None
     finally:
         await reopened.close()
 
@@ -419,7 +419,7 @@ async def test_replayed_encrypted_callback_requests_key_for_its_room(
 @pytest.mark.parametrize(
     "malformed", ["content-type", "missing-content", "missing-type"]
 )
-async def test_malformed_invitation_is_retained_and_rejected(
+async def test_malformed_invitation_is_rejected_without_advancing(
     tmp_path, sliding, malformed
 ):
     config = settings() if sliding else None
@@ -458,8 +458,8 @@ async def test_malformed_invitation_is_retained_and_rejected(
         assert reopened.cursor is None
         assert await reopened.next_batch() is None
         assert reopened.client.invited_rooms == {}
-        assert reopened._store.input[0] == body
+        assert reopened._store.input is None
         with pytest.raises(LocalProtocolError, match="malformed durable room state"):
-            await reopened._prepare_pending()
+            await reopened._accept_response(body)
     finally:
         await reopened.close()

@@ -72,7 +72,6 @@ async def interrupted(path, boundary):
             os.kill(os.getpid(), signal.SIGKILL)
 
         session._store.capture = capture
-    await session._capture_response((path / "sliding.json").read_bytes())
     if boundary == "crypto":
         original = session.client._iter_to_device
 
@@ -83,7 +82,7 @@ async def interrupted(path, boundary):
                     os.kill(os.getpid(), signal.SIGKILL)
 
         session.client._iter_to_device = devices
-    await session._prepare_pending()
+    await session._capture_response((path / "sliding.json").read_bytes())
     os.kill(os.getpid(), signal.SIGKILL)
 
 
@@ -102,19 +101,17 @@ async def test_sliding_key_and_message_recover_together_after_process_kill(
     assert result.returncode == -signal.SIGKILL, result.stderr.decode()
     client, session = opened(tmp_path)
     try:
-        if boundary == "capture":
-            assert session._store.input is None
-            assert session._sliding.device_cursor is None
-            await session._capture_response((tmp_path / "sliding.json").read_bytes())
-        elif boundary == "committed":
+        if boundary == "committed":
 
             def no_decrypt(_):
                 raise AssertionError("committed output must not decrypt again")
 
             client._iter_to_device = no_decrypt
         else:
+            # Capture commits with preparation, so a kill keeps neither.
+            assert session._store.input is None
             assert session._sliding.device_cursor is None
-        await session._prepare_pending()
+            await session._capture_response((tmp_path / "sliding.json").read_bytes())
         records = []
         while batch := await session.next_batch():
             records.extend(batch.records)
@@ -125,8 +122,8 @@ async def test_sliding_key_and_message_recover_together_after_process_kill(
         assert messages[0].crypto.verified is True
         assert session._sliding.device_cursor == "td1"
         assert session.cursor == "p1"
-        # A response prepared after reopening never resumes an old connection.
-        if boundary != "capture":
+        # A response prepared before reopening never resumes an old connection.
+        if boundary == "committed":
             assert session._sliding.pos is None
     finally:
         await session.close()

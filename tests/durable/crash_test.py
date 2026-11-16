@@ -152,9 +152,6 @@ async def receive(mode, path):
                 yield item
 
         client._iter_sync = interrupted_prepare
-    if mode == "after_capture":
-        await session._capture_response(body)
-        kill_self()
     await session._accept_response(body)
     if mode == "after_prepare":
         kill_self()
@@ -247,7 +244,6 @@ def run_worker(mode, path):
     [
         "healthy",
         "before_capture_commit",
-        "after_capture",
         "during_prepare",
         "after_prepare",
         "after_receive",

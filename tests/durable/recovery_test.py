@@ -1091,7 +1091,7 @@ async def test_oversized_state_covered_by_loss_is_not_published_again_at_tail(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("previous", ["invite", "leave"])
 @pytest.mark.parametrize("limited_timeline", [False, True])
-@pytest.mark.parametrize("restart", [None, "intent", "captured"])
+@pytest.mark.parametrize("restart", [None, "intent", "fetched"])
 async def test_known_nonjoined_room_recovers_without_account_full_state(
     tmp_path, monkeypatch, previous, limited_timeline, restart
 ):
@@ -1101,7 +1101,7 @@ async def test_known_nonjoined_room_recovers_without_account_full_state(
     bob = "@bob:example.org"
     config = DurableSyncConfig(sync_filter={"room": {"state": {"types": []}}})
     requests_seen = []
-    captured = asyncio.Event()
+    fetched = asyncio.Event()
     next_poll = asyncio.Event()
     stop = asyncio.Event()
     initial = json.loads(response(messages=0))
@@ -1157,7 +1157,7 @@ async def test_known_nonjoined_room_recovers_without_account_full_state(
 
     async def sync(request):
         requests_seen.append(dict(request.query))
-        if len(requests_seen) > 1:
+        if request.query.get("since") == "s2":
             next_poll.set()
             await stop.wait()
         return web.json_response(recovered)
@@ -1203,18 +1203,18 @@ async def test_known_nonjoined_room_recovers_without_account_full_state(
             nio_client = client()
             nio_client.homeserver = url
             session = open_session(tmp_path, nio_client, config)
-        if restart == "captured":
+        if restart == "fetched":
 
-            async def pause_after_capture(response=None):
-                captured.set()
+            async def pause_before_commit(response=None, *, new_input=None):
+                fetched.set()
                 await stop.wait()
 
-            monkeypatch.setattr(session, "_prepare_pending", pause_after_capture)
+            monkeypatch.setattr(session, "_prepare_pending", pause_before_commit)
         runner = asyncio.create_task(session.run())
         try:
-            if restart == "captured":
+            if restart == "fetched":
                 async with asyncio.timeout(5):
-                    await captured.wait()
+                    await fetched.wait()
                 assert session.cursor == "s1"
                 await session.close()
                 await nio_client.close()
@@ -1225,12 +1225,15 @@ async def test_known_nonjoined_room_recovers_without_account_full_state(
             records = await drain_sync(session)
             async with asyncio.timeout(5):
                 await next_poll.wait()
+            # Without a commit, the restarted runner repeats the same request.
+            assert requests_seen[:-1] == [requests_seen[0]] * (len(requests_seen) - 1)
+            assert len(requests_seen) == (3 if restart == "fetched" else 2)
             assert "full_state" not in requests_seen[0]
             assert "filter" not in requests_seen[0]
             assert requests_seen[0]["since"] == "s1"
-            assert "full_state" not in requests_seen[1]
-            assert json.loads(requests_seen[1]["filter"]) == config.sync_filter
-            assert requests_seen[1]["since"] == "s2"
+            assert "full_state" not in requests_seen[-1]
+            assert json.loads(requests_seen[-1]["filter"]) == config.sync_filter
+            assert requests_seen[-1]["since"] == "s2"
             assert session.cursor == "s2"
             assert session._metadata[joined]["baseline"]
             assert session._metadata[ROOM]["baseline"]

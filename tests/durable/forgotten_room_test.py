@@ -10,7 +10,7 @@ from nio.durable import DurableSyncConfig
 from nio.durable.model import OwnMembership, RecordKind
 from nio.crypto import OutboundGroupSession
 
-from .client_test import ROOM, client, open_session, response
+from .client_test import ROOM, capture_unprepared, client, open_session, response
 from .membership_test import OPERATION
 from .recovery_test import baseline
 from .runner_test import drain_sync, homeserver
@@ -75,9 +75,10 @@ async def test_missing_room_departure_survives_replay(
         # Keep another joined room in the authoritative inventory.
         body = json.loads(response(token="s2", messages=0))
         body["rooms"]["join"]["!other:example.org"] = body["rooms"]["join"].pop(ROOM)
-        await session._capture_response(json.dumps(body).encode(), full_state=True)
-        if restart == "prepared":
-            await session._prepare_pending()
+        if restart == "captured":
+            capture_unprepared(session, json.dumps(body).encode(), full_state=True)
+        else:
+            await session._capture_response(json.dumps(body).encode(), full_state=True)
         if restart != "none":
             await session.close()
             await session.client.close()
@@ -196,7 +197,7 @@ async def test_reopened_filtered_initial_sync_cannot_prove_departure(tmp_path):
                 current_membership="join",
             )
             await session.ack(await session.next_batch())
-            await session._capture_response(b'{"next_batch":"s1"}')
+            capture_unprepared(session, b'{"next_batch":"s1"}')
             await session.close()
             await session.client.close()
             # Current configuration does not describe the captured request.
@@ -232,7 +233,6 @@ async def test_missing_room_departure_rolls_back_with_cursor(tmp_path, monkeypat
     session = open_session(tmp_path)
     try:
         await baseline(session)
-        await session._capture_response(b'{"next_batch":"s2"}', full_state=True)
 
         def fail_cursor(token):
             raise RuntimeError("interrupted tail")
@@ -240,14 +240,15 @@ async def test_missing_room_departure_rolls_back_with_cursor(tmp_path, monkeypat
         with monkeypatch.context() as failing:
             failing.setattr(session._store, "set_cursor", fail_cursor)
             with pytest.raises(RuntimeError, match="interrupted tail"):
-                await session._prepare_pending()
+                await session._capture_response(b'{"next_batch":"s2"}', full_state=True)
         await session.close()
         await session.client.close()
         session = open_session(tmp_path)
         assert session.cursor == "s1"
         assert session._metadata[ROOM]["membership"] == "join"
         assert await session.next_batch() is None
-        await session._prepare_pending()
+        assert session._store.input is None
+        await session._capture_response(b'{"next_batch":"s2"}', full_state=True)
         records = await settle(session)
         assert [r.membership for r in records if r.membership] == [
             OwnMembership("join", "leave", 0, 1)
