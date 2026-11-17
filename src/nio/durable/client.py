@@ -438,7 +438,7 @@ class DurableSync:
         await self._outbound.maintain()
 
     async def run(self) -> None:
-        """Run one Classic source, draining committed batches between responses."""
+        """Run the configured source, draining committed batches between responses."""
         self._assert_active()
         if self._running is not None:
             raise LocalProtocolError("durable sync runner is already active")

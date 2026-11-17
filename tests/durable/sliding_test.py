@@ -16,7 +16,7 @@ from nio.exceptions import LocalProtocolError
 
 from .client_test import ROOM, USER, client, open_session
 from .recovery_test import member, message
-from .runner_test import drain_sync, homeserver
+from .runner_test import drain_sync, held_polls, homeserver
 
 
 def settings(**kwargs):
@@ -101,15 +101,9 @@ async def test_reopen_drops_only_connection_position_and_replays_committed_outpu
     reopened = open_session(tmp_path, config=settings())
     try:
         assert await reopened.next_batch() == batch
-        assert "pos" not in parse_qs(
-            urlsplit(reopened._sliding.request(30_000)[1]).query
-        )
-        assert (
-            json.loads(reopened._sliding.request(30_000)[2])["extensions"]["to_device"][
-                "since"
-            ]
-            == "td1"
-        )
+        _, path, body = reopened._sliding.request(30_000)
+        assert "pos" not in parse_qs(urlsplit(path).query)
+        assert json.loads(body)["extensions"]["to_device"]["since"] == "td1"
         assert reopened._sliding.baselines[ROOM]["token"] == "w1"
     finally:
         await reopened.close()
@@ -529,21 +523,7 @@ async def test_expired_position_preserves_device_delivery_cursor(tmp_path):
 async def test_each_sliding_run_polls_with_timeout_zero_until_it_accepts_a_response(
     tmp_path,
 ):
-    polls = asyncio.Queue()
-    answers = []
-
-    async def sync(request):
-        answer = asyncio.get_running_loop().create_future()
-        answers.append(answer)
-        await polls.put(((request.query.get("pos"), request.query["timeout"]), answer))
-        return await answer
-
-    async def next_poll(pos, timeout):
-        async with asyncio.timeout(5):
-            requested, answer = await polls.get()
-        assert requested == (pos, timeout)
-        return answer
-
+    sync, next_poll, answers = held_polls("pos", "timeout")
     async with homeserver(sync) as (url, _):
         nio_client = client()
         nio_client.homeserver = url
@@ -567,7 +547,7 @@ async def test_each_sliding_run_polls_with_timeout_zero_until_it_accepts_a_respo
             )
             await drain_sync(session)
             await next_poll("p2", "30000")
-            # A fresh connection within an accepted run starts at once again.
+            # A fresh connection within an accepted run polls with timeout 0 again.
             await session.update_sliding_subscriptions({ROOM: {"timeline_limit": 5}})
             await next_poll(None, "0")
             await session.quiesce()
@@ -627,12 +607,11 @@ async def test_subscription_replacement_retains_accepted_input_and_removes_stick
         assert session._store.input[0] == body
         records = await settle(session)
         assert any(r.source.get("event_id") == "$accepted" for r in records)
-        request = json.loads(session._sliding.request(30_000)[2])
+        _, path, body = session._sliding.request(30_000)
+        request = json.loads(body)
         assert set(request["room_subscriptions"]) == {ROOM}
         assert request["room_subscriptions"][ROOM]["timeline_limit"] == 20
-        assert "pos" not in parse_qs(
-            urlsplit(session._sliding.request(30_000)[1]).query
-        )
+        assert "pos" not in parse_qs(urlsplit(path).query)
     finally:
         await session.close()
 
