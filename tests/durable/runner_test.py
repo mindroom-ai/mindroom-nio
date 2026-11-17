@@ -148,7 +148,9 @@ async def test_runner_commits_before_advancing_cursor_and_finishes_empty_sync(tm
 
 
 @pytest.mark.asyncio
-async def test_each_classic_run_polls_at_once_until_it_accepts_a_response(tmp_path):
+async def test_each_classic_run_polls_with_timeout_zero_until_it_accepts_a_response(
+    tmp_path,
+):
     polls = asyncio.Queue()
     answers = []
 
@@ -158,9 +160,11 @@ async def test_each_classic_run_polls_at_once_until_it_accepts_a_response(tmp_pa
         await polls.put((request.query["timeout"], answer))
         return await answer
 
-    async def next_poll():
+    async def next_poll(timeout):
         async with asyncio.timeout(5):
-            return await polls.get()
+            requested, answer = await polls.get()
+        assert requested == timeout
+        return answer
 
     async with homeserver(sync) as (url, _):
         nio_client = client()
@@ -168,24 +172,32 @@ async def test_each_classic_run_polls_at_once_until_it_accepts_a_response(tmp_pa
         session = open_session(tmp_path, nio_client)
         runner = asyncio.create_task(session.run())
         try:
-            assert (await next_poll())[0] == "0"
+            await next_poll("0")
+            request = session._transport.request
+
+            async def discard_once(*args, **kwargs):
+                session._transport.request = request
+                body = await request(*args, **kwargs)
+                # Local work takes the source after this poll completed.
+                session._poll = None
+                return body
+
+            session._transport.request = discard_once
             # Local work takes the source before the first response arrives.
             session._poll.cancel()
-            timeout, answer = await next_poll()
-            assert timeout == "0"
-            answer.set_result(web.Response(body=response()))
+            # Answer the poll discard_once discards, then the one the run accepts.
+            for _ in range(2):
+                (await next_poll("0")).set_result(web.Response(body=response()))
             await drain_sync(session)
-            timeout, answer = await next_poll()
-            assert timeout == "30000"
-            answer.set_result(web.json_response({"errcode": "M_FORBIDDEN"}, status=403))
+            (await next_poll("30000")).set_result(
+                web.json_response({"errcode": "M_FORBIDDEN"}, status=403)
+            )
             with pytest.raises(HttpError):
                 await runner
             runner = asyncio.create_task(session.run())
-            timeout, answer = await next_poll()
-            assert timeout == "0"
-            answer.set_result(web.json_response({"next_batch": "s1"}))
+            (await next_poll("0")).set_result(web.json_response({"next_batch": "s1"}))
             assert await drain_sync(session) == []
-            assert (await next_poll())[0] == "30000"
+            await next_poll("30000")
             await session.quiesce()
             await runner
         finally:
