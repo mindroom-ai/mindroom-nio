@@ -11,6 +11,7 @@ from aiohttp import web
 from nio import Event, TimelineEventProvenance
 from nio.durable import DurableSyncConfig, SlidingSyncConfig
 from nio.durable.model import RecordKind
+from nio.durable.transport import HttpError
 from nio.exceptions import LocalProtocolError
 
 from .client_test import ROOM, USER, client, open_session
@@ -520,6 +521,61 @@ async def test_expired_position_preserves_device_delivery_cursor(tmp_path):
             await session.close()
             await nio_client.close()
             await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_each_sliding_run_polls_with_timeout_zero_until_it_accepts_a_response(
+    tmp_path,
+):
+    polls = asyncio.Queue()
+    answers = []
+
+    async def sync(request):
+        answer = asyncio.get_running_loop().create_future()
+        answers.append(answer)
+        await polls.put(((request.query.get("pos"), request.query["timeout"]), answer))
+        return await answer
+
+    async def next_poll(pos, timeout):
+        async with asyncio.timeout(5):
+            requested, answer = await polls.get()
+        assert requested == (pos, timeout)
+        return answer
+
+    async with homeserver(sync) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client, settings())
+        runner = asyncio.create_task(session.run())
+        try:
+            (await next_poll(None, "0")).set_result(web.Response(body=window("$old")))
+            await drain_sync(session)
+            (await next_poll("p1", "30000")).set_result(
+                web.json_response({"errcode": "M_FORBIDDEN"}, status=403)
+            )
+            with pytest.raises(HttpError):
+                await runner
+            # A new run on the same session keeps the connection position.
+            runner = asyncio.create_task(session.run())
+            await next_poll("p1", "0")
+            # Local work takes the source before the first response arrives.
+            session._poll.cancel()
+            (await next_poll("p1", "0")).set_result(
+                web.Response(body=window(pos="p2", initial=False))
+            )
+            await drain_sync(session)
+            await next_poll("p2", "30000")
+            # A fresh connection within an accepted run starts at once again.
+            await session.update_sliding_subscriptions({ROOM: {"timeline_limit": 5}})
+            await next_poll(None, "0")
+            await session.quiesce()
+            await runner
+        finally:
+            for answer in answers:
+                if not answer.done():
+                    answer.set_result(web.Response(body=window(pos="p3")))
+            await session.close()
+            await nio_client.close()
 
 
 @pytest.mark.asyncio
