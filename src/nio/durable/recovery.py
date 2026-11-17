@@ -194,10 +194,14 @@ class Recovery:
         return reset
 
     async def prepare(
-        self, response: SyncResponse | SlidingSyncResponse | None = None
+        self,
+        response: SyncResponse | SlidingSyncResponse | None = None,
+        *,
+        new_input: tuple[bytes, dict[str, Any]] | None = None,
     ) -> None:
+        """Prepare retained input, or capture new input in the same commit."""
         session = self.session
-        state = session._store.continuation
+        state = session._store.continuation if new_input is None else new_input[1]
         if state is None or state.get("phase") == "prepared":
             return
         if response is not None:
@@ -212,6 +216,8 @@ class Recovery:
             return
         try:
             with session._store.transaction():
+                if new_input is not None:
+                    session._store.capture(new_input[0])
                 if "phase" not in state:
                     state.update(
                         phase="tail",
@@ -245,6 +251,15 @@ class Recovery:
                         for room_id in state["unknown_rooms"]:
                             self._loss(room_id, state, "unknown authorization baseline")
                 self._tail(state)
+                # With no batch awaiting the consumer and no crypto operation
+                # in flight, retain the next due crypto request in this commit,
+                # or complete the sync here when none is due.
+                if (
+                    not session._store.has_batches()
+                    and not session._crypto_lock.locked()
+                    and session._crypto.next_request() is None
+                ):
+                    session._complete_input()
         except BaseException:
             self._poison()
             raise
@@ -455,8 +470,12 @@ class Recovery:
         await self.prepare()
         session = self.session
         state = session._store.continuation
-        assert state is not None
-        if session._store.has_batches() or state.get("phase") != "recover":
+        # Preparation may also have completed the sync and retired its input.
+        if (
+            state is None
+            or session._store.has_batches()
+            or state.get("phase") != "recover"
+        ):
             return
         room_id, info, section = self._candidates()[state["room_index"]]
         target = info.timeline.prev_batch

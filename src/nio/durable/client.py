@@ -204,27 +204,31 @@ class DurableSync:
         *,
         full_state: bool = False,
         newly_joined_room: str | None = None,
-    ) -> tuple[SyncResponse | SlidingSyncResponse, TransientSections]:
+    ) -> TransientSections:
         # A local join/leave must not overtake input being decoded for capture.
         # Only parsing runs in the worker; projection and SQLite stay on the loop.
         async with self._local_lock:
             self._assert_active()
             generation = self._sliding.generation if self._sliding is not None else 0
-            response = await asyncio.to_thread(self._decode_response, body)
+            response, transients = await asyncio.to_thread(self._decode_response, body)
             self._assert_active()
-            with self._store.transaction():
-                self._store.capture(body)
-                self._store.save_continuation(
+            if self._sliding is not None:
+                self._sliding.accepted_generation = generation
+            # Capture commits with preparation. Until that commit the previous
+            # cursor stays authoritative, so a failure or crash before it
+            # leaves this response's interval to be fetched again.
+            await self._prepare_pending(
+                response,
+                new_input=(
+                    body,
                     {
                         "full_state": full_state,
                         "newly_joined_room": newly_joined_room,
                         "transport": "sliding" if self._sliding else "classic",
-                    }
-                )
-            self._recovery.response = response[0]
-            if self._sliding is not None:
-                self._sliding.accepted_generation = generation
-            return response
+                    },
+                ),
+            )
+            return transients
 
     async def _accept_response(
         self,
@@ -233,10 +237,9 @@ class DurableSync:
         full_state: bool = False,
         newly_joined_room: str | None = None,
     ) -> None:
-        response, transients = await self._capture_response(
+        transients = await self._capture_response(
             body, full_state=full_state, newly_joined_room=newly_joined_room
         )
-        await self._prepare_pending(response)
         await deliver_transients(self.client, transients)
 
     def _change_membership(self, room_id: str, membership: str) -> OwnMembership | None:
@@ -333,10 +336,19 @@ class DurableSync:
         return room
 
     async def _prepare_pending(
-        self, response: SyncResponse | SlidingSyncResponse | None = None
+        self,
+        response: SyncResponse | SlidingSyncResponse | None = None,
+        *,
+        new_input: tuple[bytes, dict[str, Any]] | None = None,
     ) -> None:
         self._assert_active()
-        await self._recovery.prepare(response)
+        await self._recovery.prepare(response, new_input=new_input)
+
+    def _complete_input(self) -> None:
+        """Retire prepared input and publish its sync completion marker."""
+        self._store.finish_input()
+        self._recovery.response = None
+        self._store.publish((), completes_sync=True)
 
     def _save_rooms(
         self, rooms: dict[str, MatrixRoom], members: set[tuple[str, str]]
@@ -449,9 +461,7 @@ class DurableSync:
                         continue
                     await self._maintain_crypto()
                     with self._store.transaction():
-                        self._store.finish_input()
-                        self._recovery.response = None
-                        self._store.publish((), completes_sync=True)
+                        self._complete_input()
                     self._changed.set()
                     continue
                 if (

@@ -85,6 +85,19 @@ def open_session(path, nio_client=None, config=None):
     )
 
 
+def capture_unprepared(session, body, *, full_state=False):
+    """Commit input without preparing it, as earlier releases could leave it."""
+    with session._store.transaction():
+        session._store.capture(body)
+        session._store.save_continuation(
+            {
+                "full_state": full_state,
+                "newly_joined_room": None,
+                "transport": "classic",
+            }
+        )
+
+
 @pytest.mark.asyncio
 async def test_prepare_commits_replayable_messages_without_callbacks(tmp_path):
     nio_client = client()
@@ -186,7 +199,7 @@ async def test_recursive_publication_checks_cumulative_pending_bytes(tmp_path, l
 @pytest.mark.asyncio
 async def test_captured_input_is_prepared_after_restart(tmp_path):
     session = open_session(tmp_path)
-    await session._capture_response(response())
+    capture_unprepared(session, response())
     await session.close()
     reopened = open_session(tmp_path)
     try:
@@ -227,7 +240,7 @@ async def test_committed_output_and_room_state_reopen_without_processing_again(
 
 
 @pytest.mark.asyncio
-async def test_preparation_failure_discards_mutated_client_and_retains_input(
+async def test_preparation_failure_discards_mutated_client_and_keeps_cursor(
     tmp_path, monkeypatch
 ):
     nio_client = client()
@@ -248,7 +261,10 @@ async def test_preparation_failure_discards_mutated_client_and_retains_input(
     reopened = open_session(tmp_path)
     try:
         assert reopened.client.rooms == {}
-        await reopened._prepare_pending()
+        assert reopened._store.input is None
+        assert reopened.cursor is None
+        # The server repeats a response whose cursor was never committed.
+        await reopened._accept_response(response())
         assert reopened.client.rooms[ROOM].users[USER].display_name == "Alice"
     finally:
         await reopened.close()
@@ -323,7 +339,7 @@ async def test_batch_byte_bound_splits_without_dropping_messages(tmp_path):
         ),
     ],
 )
-async def test_prepared_capacity_failure_retains_input_and_poisons_client(
+async def test_prepared_capacity_failure_keeps_cursor_and_poisons_client(
     tmp_path, config, bound
 ):
     session = open_session(tmp_path, config=config)
@@ -333,7 +349,7 @@ async def test_prepared_capacity_failure_retains_input_and_poisons_client(
         await session.next_batch()
     reopened = open_session(tmp_path)
     try:
-        assert reopened._store.input is not None
+        assert reopened._store.input is None
         assert reopened._store.next_batch() is None
         assert reopened._store.cursor is None
     finally:

@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 
 import pytest
 from aiohttp import web
@@ -11,7 +11,14 @@ from nio import TimelineEventProvenance
 from nio.durable.codec import restore_event
 from nio.durable.model import RecordKind
 
-from .client_test import ROOM, USER, client, open_session, response
+from .client_test import (
+    ROOM,
+    USER,
+    capture_unprepared,
+    client,
+    open_session,
+    response,
+)
 
 
 @asynccontextmanager
@@ -247,3 +254,106 @@ async def test_quiesce_waits_for_completion_acknowledgement(tmp_path):
         finally:
             await session.close()
             await nio_client.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_sync_commits_once_before_its_acknowledgement(tmp_path):
+    empty_responses = 3
+    blocked = asyncio.Event()
+    stop = asyncio.Event()
+
+    async def sync(request):
+        since = request.query.get("since")
+        if since is None:
+            return web.Response(body=response())
+        if int(since[1:]) > empty_responses:
+            blocked.set()
+            await stop.wait()
+        return web.json_response({"next_batch": f"s{int(since[1:]) + 1}"})
+
+    async with homeserver(sync) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        runner = asyncio.create_task(session.run())
+        try:
+            await drain_sync(session)
+            statements = []
+            session._store.database.connection().set_trace_callback(statements.append)
+            for _ in range(empty_responses):
+                assert await drain_sync(session) == []
+            async with asyncio.timeout(5):
+                await blocked.wait()
+            # Capture, preparation and completion share one commit; the
+            # consumer's acknowledgement is the other.
+            assert statements.count("COMMIT") == 2 * empty_responses
+            assert session.cursor == f"s{empty_responses + 1}"
+            assert session._store.input is None
+        finally:
+            stop.set()
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held", [False, True])
+async def test_sync_preparation_retains_a_due_crypto_request_unless_the_lock_is_held(
+    tmp_path, held
+):
+    session = open_session(tmp_path)
+    try:
+        # A new device's key upload is due after this otherwise empty sync.
+        async with session._crypto_lock if held else nullcontext():
+            await session._accept_response(b'{"next_batch":"s1"}')
+        pending = session._crypto._pending()
+        assert (pending[0].kind if pending else None) == (None if held else "upload")
+        # The sync stays incomplete until the runner's maintenance pass.
+        assert session._store.has_input()
+        assert await session.next_batch() is None
+        assert session.cursor == "s1"
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_runner_completes_empty_input_left_unprepared_by_an_earlier_release(
+    tmp_path,
+):
+    polled = asyncio.Event()
+    stop = asyncio.Event()
+
+    async def sync(request):
+        since = request.query.get("since")
+        if since == "s2":
+            polled.set()
+        if since is not None:
+            await stop.wait()
+        return web.Response(body=response())
+
+    async with homeserver(sync) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        runner = asyncio.create_task(session.run())
+        await drain_sync(session)
+        await session.quiesce()
+        await runner
+        capture_unprepared(session, b'{"next_batch":"s2"}')
+        await session.close()
+        await nio_client.close()
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        runner = asyncio.create_task(session.run())
+        try:
+            assert await drain_sync(session) == []
+            async with asyncio.timeout(5):
+                await polled.wait()
+            assert session.cursor == "s2"
+            assert not runner.done()
+        finally:
+            stop.set()
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
