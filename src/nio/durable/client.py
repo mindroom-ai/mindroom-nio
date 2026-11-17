@@ -445,8 +445,8 @@ class DurableSync:
         running = asyncio.current_task()
         assert running is not None
         self._running = running
-        # Classic polls use timeout 0 until this run accepts a response, so a
-        # started client is ready without waiting out a quiet long poll.
+        # Polls use timeout 0 until this run accepts a response, so a started
+        # or restarted client is ready without waiting out a quiet long poll.
         accepted = False
         try:
             while not self._closed:
@@ -499,13 +499,14 @@ class DurableSync:
                     and self._recovery.needs_full_state()
                 )
                 request_body = None
+                timeout = self.config.sync_timeout_ms if accepted else 0
                 if self._sliding is not None:
-                    method, path, request_body = self._sliding.request()
+                    method, path, request_body = self._sliding.request(timeout)
                 else:
                     method, path = Api.sync(
                         "",
                         self.cursor,
-                        self.config.sync_timeout_ms if accepted else 0,
+                        timeout,
                         (
                             None
                             if full_state or newly_joined_room

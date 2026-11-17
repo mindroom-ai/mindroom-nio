@@ -67,7 +67,7 @@ async def test_sliding_request_owns_device_cursor_and_preserves_caller_settings(
     config = settings(lists=lists, extensions=extensions)
     session = open_session(tmp_path, config=config)
     try:
-        method, path, body = session._sliding.request()
+        method, path, body = session._sliding.request(30_000)
         request = json.loads(body)
         assert method == "POST"
         assert "pos" not in parse_qs(urlsplit(path).query)
@@ -84,7 +84,7 @@ async def test_sliding_request_owns_device_cursor_and_preserves_caller_settings(
         assert extensions == {"account_data": {"enabled": True}}
         await session._accept_response(window("$old"))
         await settle(session)
-        request = json.loads(session._sliding.request()[2])
+        request = json.loads(session._sliding.request(30_000)[2])
         assert request["extensions"]["to_device"]["since"] == "td1"
     finally:
         await session.close()
@@ -101,9 +101,9 @@ async def test_reopen_drops_only_connection_position_and_replays_committed_outpu
     reopened = open_session(tmp_path, config=settings())
     try:
         assert await reopened.next_batch() == batch
-        assert "pos" not in parse_qs(urlsplit(reopened._sliding.request()[1]).query)
+        assert "pos" not in parse_qs(urlsplit(reopened._sliding.request(30_000)[1]).query)
         assert (
-            json.loads(reopened._sliding.request()[2])["extensions"]["to_device"][
+            json.loads(reopened._sliding.request(30_000)[2])["extensions"]["to_device"][
                 "since"
             ]
             == "td1"
@@ -625,10 +625,10 @@ async def test_subscription_replacement_retains_accepted_input_and_removes_stick
         assert session._store.input[0] == body
         records = await settle(session)
         assert any(r.source.get("event_id") == "$accepted" for r in records)
-        request = json.loads(session._sliding.request()[2])
+        request = json.loads(session._sliding.request(30_000)[2])
         assert set(request["room_subscriptions"]) == {ROOM}
         assert request["room_subscriptions"][ROOM]["timeline_limit"] == 20
-        assert "pos" not in parse_qs(urlsplit(session._sliding.request()[1]).query)
+        assert "pos" not in parse_qs(urlsplit(session._sliding.request(30_000)[1]).query)
     finally:
         await session.close()
 
