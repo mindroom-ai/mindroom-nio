@@ -11,11 +11,12 @@ from aiohttp import web
 from nio import Event, TimelineEventProvenance
 from nio.durable import DurableSyncConfig, SlidingSyncConfig
 from nio.durable.model import RecordKind
+from nio.durable.transport import HttpError
 from nio.exceptions import LocalProtocolError
 
 from .client_test import ROOM, USER, client, open_session
 from .recovery_test import member, message
-from .runner_test import drain_sync, homeserver
+from .runner_test import drain_sync, held_polls, homeserver
 
 
 def settings(**kwargs):
@@ -66,7 +67,7 @@ async def test_sliding_request_owns_device_cursor_and_preserves_caller_settings(
     config = settings(lists=lists, extensions=extensions)
     session = open_session(tmp_path, config=config)
     try:
-        method, path, body = session._sliding.request()
+        method, path, body = session._sliding.request(30_000)
         request = json.loads(body)
         assert method == "POST"
         assert "pos" not in parse_qs(urlsplit(path).query)
@@ -83,7 +84,7 @@ async def test_sliding_request_owns_device_cursor_and_preserves_caller_settings(
         assert extensions == {"account_data": {"enabled": True}}
         await session._accept_response(window("$old"))
         await settle(session)
-        request = json.loads(session._sliding.request()[2])
+        request = json.loads(session._sliding.request(30_000)[2])
         assert request["extensions"]["to_device"]["since"] == "td1"
     finally:
         await session.close()
@@ -100,13 +101,9 @@ async def test_reopen_drops_only_connection_position_and_replays_committed_outpu
     reopened = open_session(tmp_path, config=settings())
     try:
         assert await reopened.next_batch() == batch
-        assert "pos" not in parse_qs(urlsplit(reopened._sliding.request()[1]).query)
-        assert (
-            json.loads(reopened._sliding.request()[2])["extensions"]["to_device"][
-                "since"
-            ]
-            == "td1"
-        )
+        _, path, body = reopened._sliding.request(30_000)
+        assert "pos" not in parse_qs(urlsplit(path).query)
+        assert json.loads(body)["extensions"]["to_device"]["since"] == "td1"
         assert reopened._sliding.baselines[ROOM]["token"] == "w1"
     finally:
         await reopened.close()
@@ -523,6 +520,47 @@ async def test_expired_position_preserves_device_delivery_cursor(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_each_sliding_run_polls_with_timeout_zero_until_it_accepts_a_response(
+    tmp_path,
+):
+    sync, next_poll, answers = held_polls("pos", "timeout")
+    async with homeserver(sync) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client, settings())
+        runner = asyncio.create_task(session.run())
+        try:
+            (await next_poll(None, "0")).set_result(web.Response(body=window("$old")))
+            await drain_sync(session)
+            (await next_poll("p1", "30000")).set_result(
+                web.json_response({"errcode": "M_FORBIDDEN"}, status=403)
+            )
+            with pytest.raises(HttpError):
+                await runner
+            # A new run on the same session keeps the connection position.
+            runner = asyncio.create_task(session.run())
+            await next_poll("p1", "0")
+            # Local work takes the source before the first response arrives.
+            session._poll.cancel()
+            (await next_poll("p1", "0")).set_result(
+                web.Response(body=window(pos="p2", initial=False))
+            )
+            await drain_sync(session)
+            await next_poll("p2", "30000")
+            # A fresh connection within an accepted run polls with timeout 0 again.
+            await session.update_sliding_subscriptions({ROOM: {"timeline_limit": 5}})
+            await next_poll(None, "0")
+            await session.quiesce()
+            await runner
+        finally:
+            for answer in answers:
+                if not answer.done():
+                    answer.set_result(web.Response(body=window(pos="p3")))
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "state",
     [
@@ -569,10 +607,11 @@ async def test_subscription_replacement_retains_accepted_input_and_removes_stick
         assert session._store.input[0] == body
         records = await settle(session)
         assert any(r.source.get("event_id") == "$accepted" for r in records)
-        request = json.loads(session._sliding.request()[2])
+        _, path, body = session._sliding.request(30_000)
+        request = json.loads(body)
         assert set(request["room_subscriptions"]) == {ROOM}
         assert request["room_subscriptions"][ROOM]["timeline_limit"] == 20
-        assert "pos" not in parse_qs(urlsplit(session._sliding.request()[1]).query)
+        assert "pos" not in parse_qs(urlsplit(path).query)
     finally:
         await session.close()
 

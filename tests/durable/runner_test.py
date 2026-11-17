@@ -67,6 +67,26 @@ async def drain_sync(session):
                 return records
 
 
+def held_polls(*names):
+    """Hold each sync request until the test answers it; check its query values."""
+    polls = asyncio.Queue()
+    answers = []
+
+    async def sync(request):
+        answer = asyncio.get_running_loop().create_future()
+        answers.append(answer)
+        await polls.put((tuple(request.query.get(name) for name in names), answer))
+        return await answer
+
+    async def next_poll(*expected):
+        async with asyncio.timeout(5):
+            requested, answer = await polls.get()
+        assert requested == expected
+        return answer
+
+    return sync, next_poll, answers
+
+
 @pytest.mark.asyncio
 async def test_partial_key_query_defers_missing_users_without_blocking_completion(
     tmp_path,
@@ -151,21 +171,7 @@ async def test_runner_commits_before_advancing_cursor_and_finishes_empty_sync(tm
 async def test_each_classic_run_polls_with_timeout_zero_until_it_accepts_a_response(
     tmp_path,
 ):
-    polls = asyncio.Queue()
-    answers = []
-
-    async def sync(request):
-        answer = asyncio.get_running_loop().create_future()
-        answers.append(answer)
-        await polls.put((request.query["timeout"], answer))
-        return await answer
-
-    async def next_poll(timeout):
-        async with asyncio.timeout(5):
-            requested, answer = await polls.get()
-        assert requested == timeout
-        return answer
-
+    sync, next_poll, answers = held_polls("timeout")
     async with homeserver(sync) as (url, _):
         nio_client = client()
         nio_client.homeserver = url

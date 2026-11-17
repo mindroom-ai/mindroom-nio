@@ -72,7 +72,7 @@ class SlidingSource:
             )
         }
 
-    def request(self) -> tuple[str, str, str]:
+    def request(self, timeout: int) -> tuple[str, str, str]:
         config = self.config
         lists, subscriptions = deepcopy(config.lists), deepcopy(
             config.room_subscriptions
@@ -97,7 +97,7 @@ class SlidingSource:
         return Api.sliding_sync(
             "",
             pos=self.pos,
-            timeout=self.session.config.sync_timeout_ms if self.pos else 0,
+            timeout=timeout if self.pos else 0,
             conn_id=config.conn_id,
             lists=lists,
             room_subscriptions=subscriptions,
