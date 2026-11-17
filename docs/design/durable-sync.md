@@ -191,6 +191,11 @@ and `wait_for_room_ready()`.
 Local changes retain an intent before HTTP, expected membership/epoch, and an
 ordered result. They must not resurrect authorization through a stale echo.
 
+A Classic `run()` polls with timeout 0 until it accepts a response, then waits up
+to `sync_timeout_ms`, so a started client completes its first sync without
+waiting out a quiet long poll. A Sliding connection without a position does the
+same.
+
 `quiesce()` cancels an unaccepted long poll and stops new polls, then finishes
 already captured input while the consumer keeps draining. It does not fetch an
 extra final response. It waits for prepared batches, including completion and

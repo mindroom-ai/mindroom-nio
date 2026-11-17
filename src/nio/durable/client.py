@@ -445,6 +445,9 @@ class DurableSync:
         running = asyncio.current_task()
         assert running is not None
         self._running = running
+        # Classic polls return at once until this run accepts a response, so a
+        # started client is ready without waiting out a quiet long poll.
+        accepted = False
         try:
             while not self._closed:
                 self._assert_active()
@@ -502,7 +505,7 @@ class DurableSync:
                     method, path = Api.sync(
                         "",
                         self.cursor,
-                        self.config.sync_timeout_ms,
+                        self.config.sync_timeout_ms if accepted else 0,
                         (
                             None
                             if full_state or newly_joined_room
@@ -557,6 +560,7 @@ class DurableSync:
                 await self._accept_response(
                     body, full_state=full_state, newly_joined_room=newly_joined_room
                 )
+                accepted = True
         finally:
             self._running = None
             self._changed.set()
