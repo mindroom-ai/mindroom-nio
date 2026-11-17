@@ -445,7 +445,7 @@ class DurableSync:
         running = asyncio.current_task()
         assert running is not None
         self._running = running
-        # Classic polls return at once until this run accepts a response, so a
+        # Classic polls use timeout 0 until this run accepts a response, so a
         # started client is ready without waiting out a quiet long poll.
         accepted = False
         try:
