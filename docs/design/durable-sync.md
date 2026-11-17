@@ -516,9 +516,9 @@ commits. The producer trial changed initial visibility spread from 22.539 to
 21.931 seconds in one run and still missed the unchanged overlap requirement.
 None of these was adopted for startup. Combining capture and preparation commits,
 and completing an empty cycle in that same commit, was adopted later for
-steady-state cost: every sync cycle commits once less, and an empty cycle with
-no crypto work due commits twice (preparation and acknowledgement) instead of
-four times, each commit an fsync on the event loop. Full-run sampling found
+steady-state cost: every sync cycle commits once less, and an empty cycle that
+preparation completes (step 2 above) commits twice (preparation and
+acknowledgement) instead of four times, each commit an fsync on the event loop. Full-run sampling found
 Nio's synchronous commits on the main thread, but that is a blocking location,
 not proof of the exact startup critical path. The remaining limit is unresolved.
 The consumer's root-preparation scheduling document records the comparisons.
