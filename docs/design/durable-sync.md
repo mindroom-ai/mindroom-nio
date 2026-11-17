@@ -79,8 +79,8 @@ For each response:
    durable observations at their event-time yield points. Commit crypto writes,
    room changes, output batches, pending crypto work, and preparation progress
    together. No application callback or network await occurs in this transaction.
-   When it publishes no batch, no crypto operation holds the crypto lock, and no
-   crypto request is due, the same transaction also retires the input and
+   When no batch awaits the consumer, no crypto operation holds the crypto lock,
+   and no crypto request is due, the same transaction also retires the input and
    publishes the completion marker; a due request is retained there instead
    and sent before completion.
 3. Expose the oldest committed batch with a read. Delivery does not claim, lease,
@@ -273,10 +273,11 @@ Unknown authorization state requires hydration or an explicit fenced loss.
 Malformed room state is not an ignorable message. The durable collector rejects
 parser failures in state/invitation observations, events carrying a state key,
 and the required membership/create/power/encryption types even if their state key
-is missing. The preparation transaction, which also captures the input, rolls
-back and disposes the client, so the response is not retained and the unchanged
-cursor fetches it again. It must not advance the cursor or emit later live
-grants using stale state. This is a protocol failure, not an automatic
+is missing. The preparation transaction rolls back and disposes the client.
+When that transaction also captures the input, nothing of the response is
+retained and the unchanged cursor fetches it again; input that a recovery
+prologue already committed stays retained. It must not advance the cursor or
+emit later live grants using stale state. This is a protocol failure, not an automatic
 repair policy. Malformed non-state messages keep their existing behavior.
 The shared invitation parser returns `BadEvent` or `UnknownBadEvent` for envelope
 schema failures, matching its existing content-error representation. Such errors
@@ -298,9 +299,10 @@ Account data and authorization state remain durable. Callback failures do not
 roll back committed input. Auxiliary notification is at least once when retried;
 exactly-once external effects remain the application's responsibility.
 Fresh transient parsing, projection, and sequential callback awaits share a
-one-second budget per response. For a response that publishes no batch, the
-completion marker commits before its transients are delivered, so the consumer
-can acknowledge completion while they are still being delivered. A callback can
+one-second budget per response. When preparation completes the sync (step 2
+above), the completion marker commits before the response's transients are
+delivered, so the consumer can acknowledge completion while they are still
+being delivered. A callback can
 be cancelled at an await when that budget expires. Parser and callback failures
 are isolated and diagnostics identify counts and exception classes without
 event content.
@@ -514,9 +516,9 @@ commits. The producer trial changed initial visibility spread from 22.539 to
 21.931 seconds in one run and still missed the unchanged overlap requirement.
 None of these was adopted for startup. Combining capture and preparation commits,
 and completing an empty cycle in that same commit, was adopted later for
-steady-state cost: every sync cycle commits once less, and an empty cycle commits
-twice (preparation and acknowledgement) instead of four times, each commit an
-fsync on the event loop. Full-run sampling found
+steady-state cost: every sync cycle commits once less, and an empty cycle with
+no crypto work due commits twice (preparation and acknowledgement) instead of
+four times, each commit an fsync on the event loop. Full-run sampling found
 Nio's synchronous commits on the main thread, but that is a blocking location,
 not proof of the exact startup critical path. The remaining limit is unresolved.
 The consumer's root-preparation scheduling document records the comparisons.
