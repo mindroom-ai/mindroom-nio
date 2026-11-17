@@ -520,8 +520,8 @@ steady-state cost: every sync cycle commits once less, and an empty cycle that
 preparation completes (step 2 above) commits twice (preparation and
 acknowledgement) instead of four times, each commit an fsync on the event loop.
 Full-run sampling found Nio's synchronous commits on the main thread, but that
-is a blocking location,
-not proof of the exact startup critical path. The remaining limit is unresolved.
+is a blocking location, not proof of the exact startup critical path. The
+remaining limit is unresolved.
 The consumer's root-preparation scheduling document records the comparisons.
 
 Keep the existing ownership split and FULL durability while measuring that path.
