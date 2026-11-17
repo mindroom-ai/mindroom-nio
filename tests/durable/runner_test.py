@@ -10,6 +10,7 @@ from aiohttp import web
 from nio import TimelineEventProvenance
 from nio.durable.codec import restore_event
 from nio.durable.model import RecordKind
+from nio.durable.transport import HttpError
 
 from .client_test import (
     ROOM,
@@ -142,6 +143,67 @@ async def test_runner_commits_before_advancing_cursor_and_finishes_empty_sync(tm
             assert any(path.endswith("/keys/upload") for path, _ in requests)
         finally:
             release.set()
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
+async def test_each_classic_run_polls_with_timeout_zero_until_it_accepts_a_response(
+    tmp_path,
+):
+    polls = asyncio.Queue()
+    answers = []
+
+    async def sync(request):
+        answer = asyncio.get_running_loop().create_future()
+        answers.append(answer)
+        await polls.put((request.query["timeout"], answer))
+        return await answer
+
+    async def next_poll(timeout):
+        async with asyncio.timeout(5):
+            requested, answer = await polls.get()
+        assert requested == timeout
+        return answer
+
+    async with homeserver(sync) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        runner = asyncio.create_task(session.run())
+        try:
+            await next_poll("0")
+            request = session._transport.request
+
+            async def discard_once(*args, **kwargs):
+                session._transport.request = request
+                body = await request(*args, **kwargs)
+                # Local work takes the source after this poll completed.
+                session._poll = None
+                return body
+
+            session._transport.request = discard_once
+            # Local work takes the source before the first response arrives.
+            session._poll.cancel()
+            # Answer the poll discard_once discards, then the one the run accepts.
+            for _ in range(2):
+                (await next_poll("0")).set_result(web.Response(body=response()))
+            await drain_sync(session)
+            (await next_poll("30000")).set_result(
+                web.json_response({"errcode": "M_FORBIDDEN"}, status=403)
+            )
+            with pytest.raises(HttpError):
+                await runner
+            runner = asyncio.create_task(session.run())
+            (await next_poll("0")).set_result(web.json_response({"next_batch": "s1"}))
+            assert await drain_sync(session) == []
+            await next_poll("30000")
+            await session.quiesce()
+            await runner
+        finally:
+            for answer in answers:
+                if not answer.done():
+                    answer.set_result(web.json_response({"next_batch": "s1"}))
             await session.close()
             await nio_client.close()
 
