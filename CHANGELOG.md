@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.4.1
+
+- `DurableSync.run()` now sends Sliding Sync polls with timeout 0 until that run accepts a response too, as Classic polls already did in 1.4.0, so a run restarted on the same session with a kept position is ready without waiting out a quiet long poll.
+
 ## 1.4.0
 
 - A durable sync cycle commits once less: the response is kept in the same transaction as its preparation, and when no batch waits for the consumer, the crypto lock is free and no crypto request is due, that transaction also retires the input and publishes the completion marker, so an empty cycle commits twice instead of four times. A failure or crash before that commit keeps nothing, and the next request fetches the interval again; when preparation completes the sync, the completion marker commits before that response's typing, receipt and presence events are delivered.
