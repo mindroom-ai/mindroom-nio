@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.4.0
+
+- A durable sync cycle commits once less: the response is kept in the same transaction as its preparation, and when no batch waits for the consumer, the crypto lock is free and no crypto request is due, that transaction also retires the input and publishes the completion marker, so an empty cycle commits twice instead of four times. A failure or crash before that commit keeps nothing, and the next request fetches the interval again; when preparation completes the sync, the completion marker commits before that response's typing, receipt and presence events are delivered.
+- `DurableSync.run()` sends Classic polls with timeout 0 until that run accepts a response, then `sync_timeout_ms`, so a started or reloaded client is ready without waiting out a quiet long poll. Sliding Sync is unchanged.
+
 ## 1.3.0
 
 - Add `AsyncClient.room_encrypt(room_id, event_type, content, *, ignore_unverified_devices=False, count_toward_rotation=True)`, which shares the room's group session the way `room_send` does and returns the encrypted content without sending it; `count_toward_rotation=False` keeps a message from advancing count-based Megolm rotation, while age and membership rotation still apply.
