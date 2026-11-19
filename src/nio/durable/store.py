@@ -6,7 +6,7 @@ import json
 import os
 from collections import deque
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -107,6 +107,8 @@ class DurableStore:
         self._intent_cached = False
         self._local_intent: dict[str, Any] | None = None
         self._loop_state: _LoopState | None = None
+        # An acknowledged empty batch whose deletion the next commit writes.
+        self._deferred_ack: int | None = None
         self._lease = FileLease(self.path)
         self.database = _Database(
             str(self.path),
@@ -261,8 +263,13 @@ class DurableStore:
         self._transaction_depth += 1
         self._invalidate_local_intent()
         try:
+            outermost = self._transaction_depth == 1
             with self.database.atomic("IMMEDIATE"):
+                if outermost and self._deferred_ack is not None:
+                    self._save_ack(self._deferred_ack)
                 yield
+            if outermost:
+                self._deferred_ack = None
         except BaseException:
             # A failed commit or nested rollback invalidates speculative writes.
             # Reload from this connection before comparing another projection.
@@ -341,14 +348,17 @@ class DurableStore:
             row = self.database.execute_sql(
                 "SELECT continuation FROM NioDurableInput WHERE id=1"
             ).fetchone()
+            # A failed transaction leaves a deferred acknowledgement unwritten.
+            deferred = self._deferred_ack
             pending = deque(
                 sequence
                 for (sequence,) in self.database.execute_sql(
                     "SELECT sequence FROM NioDurableBatch ORDER BY sequence"
                 )
+                if sequence != deferred
             )
             self._loop_state = _LoopState(
-                cursor, acked_sequence, row[0] if row else None, pending
+                cursor, deferred or acked_sequence, row[0] if row else None, pending
             )
         return self._loop_state
 
@@ -461,8 +471,11 @@ class DurableStore:
             if self.database.server_version >= (3, 43, 0)
             else "length(CAST(records AS BLOB))"
         )
+        # An acknowledged batch can await its deletion; see ack().
         return self.database.execute_sql(
-            f"SELECT COALESCE(SUM({byte_length}),0) FROM NioDurableBatch"
+            f"SELECT COALESCE(SUM({byte_length}),0) FROM NioDurableBatch "
+            "WHERE sequence>?",
+            (self._state().acked_sequence,),
         ).fetchone()[0]
 
     def next_batch(self) -> SyncBatch | None:
@@ -489,20 +502,38 @@ class DurableStore:
             return
         if not state.pending or batch.sequence != state.pending[0]:
             raise LocalProtocolError("acknowledgement must name the oldest batch")
+        if (
+            not batch.records
+            and len(state.pending) == 1
+            and not self._transaction_depth
+        ):
+            # A crash before the consumer acknowledges already redelivers the
+            # batch, and an empty one repeats no record. So the acknowledgement
+            # of the only queued, empty batch costs no commit of its own: the
+            # next transaction, or close(), writes it.
+            state.pending.popleft()
+            state.acked_sequence = self._deferred_ack = batch.sequence
+            return
         with self.transaction():
-            self.database.execute_sql(
-                "DELETE FROM NioDurableBatch WHERE sequence=?", (batch.sequence,)
-            )
-            self.database.execute_sql(
-                "UPDATE NioDurableMeta SET acked_sequence=? WHERE id=1",
-                (batch.sequence,),
-            )
+            self._save_ack(batch.sequence)
             state.pending.popleft()
             state.acked_sequence = batch.sequence
+
+    def _save_ack(self, sequence: int) -> None:
+        self.database.execute_sql(
+            "DELETE FROM NioDurableBatch WHERE sequence=?", (sequence,)
+        )
+        self.database.execute_sql(
+            "UPDATE NioDurableMeta SET acked_sequence=? WHERE id=1", (sequence,)
+        )
 
     def close(self) -> None:
         if self._closed:
             return
+        if self._deferred_ack is not None and not self._transaction_depth:
+            # Best effort: losing this write only redelivers an empty batch.
+            with suppress(Exception), self.transaction():
+                pass
         if not self.database.is_closed():
             self.database.close()
         self.database.revoked = True

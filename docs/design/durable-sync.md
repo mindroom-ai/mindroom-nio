@@ -85,6 +85,16 @@ For each response:
    and sent before completion.
 3. Expose the oldest committed batch with a read. Delivery does not claim, lease,
    hash, or rewrite the records. Acknowledgement deletes that batch transactionally.
+   The acknowledgement of an empty batch that is the only one queued, such as
+   an idle sync's completion marker, takes no commit of its own: it holds in
+   memory and the next transaction, or `close()`, writes it. If that
+   transaction fails, the acknowledgement stays held for the one after. A
+   crash before that write redelivers the empty batch, as a crash before the
+   acknowledgement does (step 4), so a restarted consumer can be given a
+   completion marker before the session's first request: completion of a
+   replayed batch does not show that this process has received a response.
+   Every other acknowledgement commits at once, or with the transaction it
+   is made in.
 4. MindRoom atomically inserts a batch receipt and its admission effects, applies
    ordered lifecycle hooks, then acknowledges nio. A crash between these steps
    redelivers the same batch; business admission is idempotent.
@@ -212,7 +222,7 @@ whether receipt/semantic novelty warrants dispatch and acknowledges separately.
 Callback failure leaves the batch available; it does not poison committed state.
 `progress_generation` is an opaque monotonic value that advances on committed batch publication and acknowledgement, including while a prepared backlog drains.
 It sums the published high-water mark (the highest queued or acknowledged sequence) and the acknowledged sequence, using existing durable state without a separate counter.
-Duplicate acknowledgements and rolled-back writes leave it unchanged, and reopening the same stream preserves it.
+Duplicate acknowledgements and rolled-back writes leave it unchanged, and reopening the same stream preserves it, except that a process killed before an empty batch's acknowledgement was written (step 3) reopens one acknowledgement earlier.
 Compare generations to detect progress; the value is not a batch sequence or a count of events.
 `cursor` exposes the last prepared Matrix position.
 
@@ -524,6 +534,8 @@ and completing an empty cycle in that same commit, was adopted later for
 steady-state cost: every sync cycle commits once less, and an empty cycle that
 preparation completes (step 2 above) commits twice (preparation and
 acknowledgement) instead of four times, each commit an fsync on the event loop.
+Writing an empty batch's acknowledgement with the next commit (step 3) then
+left an idle cycle one commit, and every other cycle one commit less again.
 Full-run sampling found Nio's synchronous commits on the main thread, but that
 is a blocking location, not proof of the exact startup critical path. The
 remaining limit is unresolved.
