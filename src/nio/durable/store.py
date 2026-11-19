@@ -53,8 +53,6 @@ class _LoopState:
     """The retained input's encoded continuation, or None without input."""
     pending: deque[int]
     """Published batch sequences, oldest first."""
-    ack_deferred: bool = False
-    """Whether ``acked_sequence`` awaits the next transaction's commit."""
 
 
 class _MatrixStore(SqliteStore):
@@ -109,6 +107,8 @@ class DurableStore:
         self._intent_cached = False
         self._local_intent: dict[str, Any] | None = None
         self._loop_state: _LoopState | None = None
+        # An acknowledged empty batch whose deletion the next commit writes.
+        self._deferred_ack: int | None = None
         self._lease = FileLease(self.path)
         self.database = _Database(
             str(self.path),
@@ -263,12 +263,13 @@ class DurableStore:
         self._transaction_depth += 1
         self._invalidate_local_intent()
         try:
+            outermost = self._transaction_depth == 1
             with self.database.atomic("IMMEDIATE"):
-                state = self._loop_state
-                if state is not None and state.ack_deferred:
-                    self._save_ack(state.acked_sequence)
-                    state.ack_deferred = False
+                if outermost and self._deferred_ack is not None:
+                    self._save_ack(self._deferred_ack)
                 yield
+            if outermost:
+                self._deferred_ack = None
         except BaseException:
             # A failed commit or nested rollback invalidates speculative writes.
             # Reload from this connection before comparing another projection.
@@ -347,14 +348,17 @@ class DurableStore:
             row = self.database.execute_sql(
                 "SELECT continuation FROM NioDurableInput WHERE id=1"
             ).fetchone()
+            # A failed transaction leaves a deferred acknowledgement unwritten.
+            deferred = self._deferred_ack
             pending = deque(
                 sequence
                 for (sequence,) in self.database.execute_sql(
                     "SELECT sequence FROM NioDurableBatch ORDER BY sequence"
                 )
+                if sequence != deferred
             )
             self._loop_state = _LoopState(
-                cursor, acked_sequence, row[0] if row else None, pending
+                cursor, deferred or acked_sequence, row[0] if row else None, pending
             )
         return self._loop_state
 
@@ -498,14 +502,17 @@ class DurableStore:
             return
         if not state.pending or batch.sequence != state.pending[0]:
             raise LocalProtocolError("acknowledgement must name the oldest batch")
-        if not batch.records and len(state.pending) == 1:
+        if (
+            not batch.records
+            and len(state.pending) == 1
+            and not self._transaction_depth
+        ):
             # A crash before the consumer acknowledges already redelivers the
             # batch, and an empty one repeats no record. So the acknowledgement
             # of the only queued, empty batch costs no commit of its own: the
             # next transaction, or close(), writes it.
             state.pending.popleft()
-            state.acked_sequence = batch.sequence
-            state.ack_deferred = True
+            state.acked_sequence = self._deferred_ack = batch.sequence
             return
         with self.transaction():
             self._save_ack(batch.sequence)
@@ -523,8 +530,7 @@ class DurableStore:
     def close(self) -> None:
         if self._closed:
             return
-        state = self._loop_state
-        if state is not None and state.ack_deferred and not self._transaction_depth:
+        if self._deferred_ack is not None and not self._transaction_depth:
             # Best effort: losing this write only redelivers an empty batch.
             with suppress(Exception), self.transaction():
                 pass

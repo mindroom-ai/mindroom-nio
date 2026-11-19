@@ -359,21 +359,38 @@ def test_acknowledgement_that_could_repeat_or_reorder_a_batch_commits_at_once(
         store.close()
 
 
-def test_failed_transaction_returns_an_unwritten_acknowledgement(tmp_path):
+def test_failed_transaction_keeps_a_deferred_acknowledgement_for_the_next(tmp_path):
     store = open_store(tmp_path)
     try:
         with store.transaction():
             batch = store.publish((), completes_sync=True)
         store.ack(batch)
+        progress = store.progress_generation
         with pytest.raises(RuntimeError, match="interrupted"):
             with store.transaction():
                 raise RuntimeError("interrupted")
-        # The rollback kept the batch, so memory offers it again as SQLite does.
+        # The rollback kept the row, but this process never offers it again.
         assert durable_ack(store) == (batch.sequence - 1, 1)
-        assert (store.acked_sequence, store.next_batch()) == (batch.sequence - 1, batch)
-        store.ack(batch)
+        assert (store.acked_sequence, store.next_batch()) == (batch.sequence, None)
+        assert (store.progress_generation, store.pending_bytes) == (progress, 0)
         with store.transaction():
-            pass
-        assert durable_ack(store) == (batch.sequence, 0)
+            later = store.publish((), completes_sync=True)
+        assert durable_ack(store) == (batch.sequence, 1)
+        assert store.next_batch() == later
+    finally:
+        store.close()
+
+
+def test_acknowledgement_inside_a_transaction_commits_with_it(tmp_path):
+    store = open_store(tmp_path)
+    try:
+        with store.transaction():
+            batch = store.publish((), completes_sync=True)
+        with store.transaction():
+            store.ack(batch)
+            later = store.publish((message(),))
+        # Deferring here would leave the acknowledged row ahead of the new one.
+        assert durable_ack(store) == (batch.sequence, 1)
+        assert store.next_batch() == later
     finally:
         store.close()

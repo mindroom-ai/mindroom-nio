@@ -87,9 +87,14 @@ For each response:
    hash, or rewrite the records. Acknowledgement deletes that batch transactionally.
    The acknowledgement of an empty batch that is the only one queued, such as
    an idle sync's completion marker, takes no commit of its own: it holds in
-   memory and the next transaction, or `close()`, writes it. A crash before
-   that write redelivers the empty batch, as a crash before the
-   acknowledgement does (step 4). Every other acknowledgement commits at once.
+   memory and the next transaction, or `close()`, writes it. If that
+   transaction fails, the acknowledgement stays held for the one after. A
+   crash before that write redelivers the empty batch, as a crash before the
+   acknowledgement does (step 4), so a restarted consumer can be given a
+   completion marker before the session's first request: completion of a
+   replayed batch does not show that this process has received a response.
+   Every other acknowledgement commits at once, or with the transaction it
+   is made in.
 4. MindRoom atomically inserts a batch receipt and its admission effects, applies
    ordered lifecycle hooks, then acknowledges nio. A crash between these steps
    redelivers the same batch; business admission is idempotent.
