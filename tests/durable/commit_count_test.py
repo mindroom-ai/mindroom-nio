@@ -23,7 +23,7 @@ def classic(index, *event_ids):
 
 def sliding(index, *event_ids):
     if event_ids:
-        return window(*event_ids, pos=f"p{index}", initial=False, num_live=1)
+        return window(*event_ids, pos=f"p{index}", initial=False, num_live=1, state=[])
     return json.dumps(
         {
             "pos": f"p{index}",
