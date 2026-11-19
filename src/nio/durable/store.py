@@ -6,7 +6,7 @@ import json
 import os
 from collections import deque
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,6 +53,8 @@ class _LoopState:
     """The retained input's encoded continuation, or None without input."""
     pending: deque[int]
     """Published batch sequences, oldest first."""
+    ack_deferred: bool = False
+    """Whether ``acked_sequence`` awaits the next transaction's commit."""
 
 
 class _MatrixStore(SqliteStore):
@@ -262,6 +264,10 @@ class DurableStore:
         self._invalidate_local_intent()
         try:
             with self.database.atomic("IMMEDIATE"):
+                state = self._loop_state
+                if state is not None and state.ack_deferred:
+                    self._save_ack(state.acked_sequence)
+                    state.ack_deferred = False
                 yield
         except BaseException:
             # A failed commit or nested rollback invalidates speculative writes.
@@ -489,20 +495,36 @@ class DurableStore:
             return
         if not state.pending or batch.sequence != state.pending[0]:
             raise LocalProtocolError("acknowledgement must name the oldest batch")
-        with self.transaction():
-            self.database.execute_sql(
-                "DELETE FROM NioDurableBatch WHERE sequence=?", (batch.sequence,)
-            )
-            self.database.execute_sql(
-                "UPDATE NioDurableMeta SET acked_sequence=? WHERE id=1",
-                (batch.sequence,),
-            )
+        if not batch.records and len(state.pending) == 1:
+            # A crash before the consumer acknowledges already redelivers the
+            # batch, and an empty one repeats no record. So the acknowledgement
+            # of the only queued, empty batch costs no commit of its own: the
+            # next transaction, or close(), writes it.
             state.pending.popleft()
             state.acked_sequence = batch.sequence
+            state.ack_deferred = True
+            return
+        with self.transaction():
+            self._save_ack(batch.sequence)
+            state.pending.popleft()
+            state.acked_sequence = batch.sequence
+
+    def _save_ack(self, sequence: int) -> None:
+        self.database.execute_sql(
+            "DELETE FROM NioDurableBatch WHERE sequence=?", (sequence,)
+        )
+        self.database.execute_sql(
+            "UPDATE NioDurableMeta SET acked_sequence=? WHERE id=1", (sequence,)
+        )
 
     def close(self) -> None:
         if self._closed:
             return
+        state = self._loop_state
+        if state is not None and state.ack_deferred and not self._transaction_depth:
+            # Best effort: losing this write only redelivers an empty batch.
+            with suppress(Exception), self.transaction():
+                pass
         if not self.database.is_closed():
             self.database.close()
         self.database.revoked = True
