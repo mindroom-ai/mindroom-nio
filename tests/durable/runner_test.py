@@ -325,46 +325,6 @@ async def test_quiesce_waits_for_completion_acknowledgement(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_empty_sync_commits_once_before_its_acknowledgement(tmp_path):
-    empty_responses = 3
-    blocked = asyncio.Event()
-    stop = asyncio.Event()
-
-    async def sync(request):
-        since = request.query.get("since")
-        if since is None:
-            return web.Response(body=response())
-        if int(since[1:]) > empty_responses:
-            blocked.set()
-            await stop.wait()
-        return web.json_response({"next_batch": f"s{int(since[1:]) + 1}"})
-
-    async with homeserver(sync) as (url, _):
-        nio_client = client()
-        nio_client.homeserver = url
-        session = open_session(tmp_path, nio_client)
-        runner = asyncio.create_task(session.run())
-        try:
-            await drain_sync(session)
-            statements = []
-            session._store.database.connection().set_trace_callback(statements.append)
-            for _ in range(empty_responses):
-                assert await drain_sync(session) == []
-            async with asyncio.timeout(5):
-                await blocked.wait()
-            # Capture, preparation and completion share one commit; the
-            # consumer's acknowledgement is the other.
-            assert statements.count("COMMIT") == 2 * empty_responses
-            assert session.cursor == f"s{empty_responses + 1}"
-            assert session._store.input is None
-        finally:
-            stop.set()
-            await session.close()
-            await nio_client.close()
-            await asyncio.gather(runner, return_exceptions=True)
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("held", [False, True])
 async def test_sync_preparation_retains_a_due_crypto_request_unless_the_lock_is_held(
     tmp_path, held

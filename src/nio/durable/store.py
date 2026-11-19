@@ -467,8 +467,11 @@ class DurableStore:
             if self.database.server_version >= (3, 43, 0)
             else "length(CAST(records AS BLOB))"
         )
+        # An acknowledged batch can await its deletion; see ack().
         return self.database.execute_sql(
-            f"SELECT COALESCE(SUM({byte_length}),0) FROM NioDurableBatch"
+            f"SELECT COALESCE(SUM({byte_length}),0) FROM NioDurableBatch "
+            "WHERE sequence>?",
+            (self._state().acked_sequence,),
         ).fetchone()[0]
 
     def next_batch(self) -> SyncBatch | None:

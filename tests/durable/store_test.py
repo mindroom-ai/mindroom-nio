@@ -1,5 +1,6 @@
 """Crash boundaries and ownership of the compact durable store."""
 
+import shutil
 from uuid import UUID
 
 import pytest
@@ -281,3 +282,98 @@ def test_durable_writer_uses_full_synchronous_on_open_and_reopen(tmp_path):
             )
         finally:
             store.close()
+
+
+def durable_ack(store):
+    """Return the committed acknowledgement and batch count, as a crash leaves them."""
+    return store.database.execute_sql(
+        "SELECT acked_sequence,(SELECT COUNT(*) FROM NioDurableBatch) "
+        "FROM NioDurableMeta"
+    ).fetchone()
+
+
+def trace(store):
+    statements = []
+    store.database.connection().set_trace_callback(statements.append)
+    return statements
+
+
+@pytest.mark.parametrize("writer", ["transaction", "close"])
+def test_only_empty_batch_acknowledgement_joins_the_next_commit(tmp_path, writer):
+    store = open_store(tmp_path / "store")
+    try:
+        with store.transaction():
+            batch = store.publish((), completes_sync=True)
+        statements = trace(store)
+        store.ack(batch)
+        assert "COMMIT" not in statements
+        assert durable_ack(store) == (batch.sequence - 1, 1)
+        assert (store.has_batches(), store.next_batch()) == (False, None)
+        assert (store.acked_sequence, store.pending_bytes) == (batch.sequence, 0)
+        # A process killed here leaves the batch for redelivery.
+        shutil.copytree(tmp_path / "store", tmp_path / "killed")
+        if writer == "transaction":
+            with store.transaction():
+                later = store.publish((message(),))
+            assert statements.count("COMMIT") == 1
+            assert store.next_batch() == later
+            assert durable_ack(store) == (batch.sequence, 1)
+    finally:
+        store.close()
+    reopened = open_store(tmp_path / "store")
+    try:
+        assert reopened.acked_sequence == batch.sequence
+        assert reopened.has_batches() == (writer == "transaction")
+        reopened.ack(batch)
+    finally:
+        reopened.close()
+    killed = open_store(tmp_path / "killed")
+    try:
+        assert killed.acked_sequence == batch.sequence - 1
+        assert killed.next_batch() == batch
+        killed.ack(batch)
+        assert killed.next_batch() is None
+    finally:
+        killed.close()
+
+
+def test_acknowledgement_that_could_repeat_or_reorder_a_batch_commits_at_once(
+    tmp_path,
+):
+    store = open_store(tmp_path)
+    try:
+        with store.transaction():
+            empty = store.publish((), completes_sync=True)
+            full = store.publish((message(),))
+        statements = trace(store)
+        # Another batch is queued: its delivery must not read the empty one.
+        store.ack(empty)
+        assert statements.count("COMMIT") == 1
+        assert durable_ack(store) == (empty.sequence, 1)
+        assert store.next_batch() == full
+        # Redelivery of a batch with records would repeat them.
+        store.ack(full)
+        assert statements.count("COMMIT") == 2
+        assert durable_ack(store) == (full.sequence, 0)
+    finally:
+        store.close()
+
+
+def test_failed_transaction_returns_an_unwritten_acknowledgement(tmp_path):
+    store = open_store(tmp_path)
+    try:
+        with store.transaction():
+            batch = store.publish((), completes_sync=True)
+        store.ack(batch)
+        with pytest.raises(RuntimeError, match="interrupted"):
+            with store.transaction():
+                raise RuntimeError("interrupted")
+        # The rollback kept the batch, so memory offers it again as SQLite does.
+        assert durable_ack(store) == (batch.sequence - 1, 1)
+        assert (store.acked_sequence, store.next_batch()) == (batch.sequence - 1, batch)
+        store.ack(batch)
+        with store.transaction():
+            pass
+        assert durable_ack(store) == (batch.sequence, 0)
+    finally:
+        store.close()
