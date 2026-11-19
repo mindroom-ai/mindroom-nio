@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.4.2
+
+- An idle durable sync cycle commits once instead of twice, and every other cycle once less: the acknowledgement of an empty batch that is the only one queued is written by the next transaction or by `close()`. An acknowledgement inside an open transaction is written there, and a failed transaction keeps the deferred acknowledgement, so `progress_generation` never moves backward. A process killed before that write is given the empty batch again after it restarts, before its first request, so a consumer must not take a completion whose receipt it already holds as proof that it has caught up.
+
 ## 1.4.1
 
 - `DurableSync.run()` now sends Sliding Sync polls with timeout 0 until that run accepts a response too, as Classic polls already did in 1.4.0, so a run restarted on the same session with a kept position is ready without waiting out a quiet long poll.
