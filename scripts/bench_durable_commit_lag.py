@@ -163,10 +163,13 @@ async def run(args: argparse.Namespace, directory: Path) -> dict[str, float]:
         cycles = responses - first
         for task in tasks[:2]:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         await session.close()
         await client.close()
         await runner.cleanup()
+    for result in results:
+        if isinstance(result, Exception):
+            raise result
     stalls = [lag for lag in lags if lag >= STALL]
     return {
         "seconds": round(elapsed, 2),

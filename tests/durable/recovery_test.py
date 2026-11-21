@@ -142,14 +142,21 @@ async def test_recovery_commits_wait_for_the_disk_off_the_event_loop(
         await baseline(session)
         # Upload the new account's keys first: crypto requests commit on the loop.
         await session._maintain_crypto()
+        loop = asyncio.get_running_loop()
         connection = session._store.database.connection()
         changes = [connection.total_changes]
-        on_loop = []
+        waited = []
         commit = SqliteDatabase.commit
 
         def record(database):
             if connection.total_changes > changes[-1]:
-                on_loop.append(threading.current_thread() is threading.main_thread())
+                # A writing commit finishes only after the event loop ran.
+                ran = threading.Event()
+                loop.call_soon_threadsafe(ran.set)
+                waited.append(
+                    threading.current_thread() is not threading.main_thread()
+                    and ran.wait(5)
+                )
             changes.append(connection.total_changes)
             return commit(database)
 
@@ -165,8 +172,8 @@ async def test_recovery_commits_wait_for_the_disk_off_the_event_loop(
             ] == ["$before", "$tail"]
             # Capture, the history page, the tail, completion and every
             # acknowledgement that writes commit in the worker thread.
-            assert len(on_loop) >= 5
-            assert not any(on_loop)
+            assert len(waited) >= 5
+            assert all(waited)
         finally:
             await session.close()
             await nio_client.close()

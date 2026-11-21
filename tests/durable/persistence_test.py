@@ -1,6 +1,9 @@
 """Reduce repeated persistence work without changing committed observations."""
 
+import asyncio
 import json
+import threading
+import time
 from contextlib import nullcontext
 
 import pytest
@@ -183,7 +186,9 @@ def test_durable_writes_need_the_stores_own_transaction(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_failed_ack_commit_reloads_pending_batches(tmp_path, monkeypatch):
+async def test_failed_ack_commit_closes_the_store_and_keeps_the_batch(
+    tmp_path, monkeypatch
+):
     store = open_store(tmp_path)
     try:
         with store.transaction():
@@ -196,15 +201,19 @@ async def test_failed_ack_commit_reloads_pending_batches(tmp_path, monkeypatch):
         with pytest.raises(RuntimeError, match="disk full"):
             await store.ack(batch)
         monkeypatch.undo()
-        assert store.has_batches()
-        assert store.acked_sequence == 0
-        assert store.next_batch() == batch
+        with pytest.raises(LocalProtocolError, match="closed"):
+            store.has_batches()
+    finally:
+        store.close()
+    store = open_store(tmp_path)
+    try:
+        assert (store.acked_sequence, store.next_batch()) == (0, batch)
     finally:
         store.close()
 
 
 @pytest.mark.asyncio
-async def test_failed_off_loop_commit_reloads_state_and_keeps_a_held_ack(
+async def test_failed_off_loop_commit_closes_the_store_to_waiting_writers(
     tmp_path, monkeypatch
 ):
     store = open_store(tmp_path)
@@ -213,32 +222,38 @@ async def test_failed_off_loop_commit_reloads_state_and_keeps_a_held_ack(
             store.capture(b'{"next_batch":"s1"}')
             empty = store.publish((), completes_sync=True)
         await store.ack(empty)
-        before = loop_view(store)
+        started = threading.Event()
 
         def fail(database):
+            started.set()
+            time.sleep(0.2)
             raise RuntimeError("disk full")
 
-        monkeypatch.setattr(SqliteDatabase, "commit", fail)
-        with pytest.raises(RuntimeError, match="disk full"):
+        async def complete():
             async with store.transaction_async():
                 store.finish_input()
                 store.publish((), completes_sync=True)
-                assert loop_view(store)[:2] == (True, False)
-        monkeypatch.undo()
-        assert loop_view(store) == before
-        with pytest.raises(RuntimeError, match="body"):
-            async with store.transaction_async():
+
+        monkeypatch.setattr(SqliteDatabase, "commit", fail)
+        completion = asyncio.create_task(complete())
+        assert await asyncio.to_thread(started.wait, 5)
+        # A writer on the loop waits for the failing commit; it must not then
+        # commit in-memory state that the rollback could not undo.
+        with pytest.raises(LocalProtocolError, match="closed"):
+            with store.transaction():
                 store.publish(())
-                raise RuntimeError("body")
-        assert loop_view(store) == before
-        # The rolled-back commit leaves the next one free to begin, and that
-        # one still writes the held acknowledgement.
-        with store.transaction():
-            store.finish_input()
+        with pytest.raises(RuntimeError, match="disk full"):
+            await completion
+        monkeypatch.undo()
+        with pytest.raises(LocalProtocolError, match="closed"):
+            store.has_input()
+    finally:
         store.close()
-        store = open_store(tmp_path)
-        assert (store.has_input(), store.acked_sequence) == (False, empty.sequence)
-        assert store.next_batch() is None
+    store = open_store(tmp_path)
+    try:
+        # Neither the completion nor the acknowledgement it carried was kept.
+        assert (store.has_input(), store.acked_sequence) == (True, 0)
+        assert store.next_batch() == empty
     finally:
         store.close()
 

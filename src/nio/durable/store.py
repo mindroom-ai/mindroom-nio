@@ -7,12 +7,14 @@ import json
 import os
 import threading
 from collections import deque
-from collections.abc import AsyncIterator, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import AsyncIterator, Callable, Iterator
+from concurrent.futures import Future
 from contextlib import asynccontextmanager, contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
+from queue import SimpleQueue
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -33,16 +35,16 @@ from .model import SyncBatch, SyncRecord, decode_records, encode_json, encode_re
 
 
 class _Database(SqliteDatabase):
-    """One connection shared by the event loop and the store's commit worker.
+    """One connection shared by the event loop and the store's commit thread.
 
-    A commit in the worker holds the lock until it is durable, so loop code
+    The commit thread holds the lock until its commit is durable, so loop code
     that reaches SQLite meanwhile waits for it instead of reading or joining
-    the transaction being committed.
+    the transaction being committed. A loop transaction began under the lock,
+    so it commits or rolls back without it.
     """
 
     revoked = False
-    commit_later = False
-    """Leave the outermost transaction open for the commit worker."""
+    commit_error: BaseException | None = None
 
     def __init__(self, database: str, **kwargs: Any) -> None:
         super().__init__(database, thread_safe=False, check_same_thread=False, **kwargs)
@@ -53,15 +55,17 @@ class _Database(SqliteDatabase):
             raise LocalProtocolError("durable store is closed")
         return super().connect(reuse_if_open)
 
-    def execute_sql(self, sql, params=None, commit=None):
+    def execute_sql(self, *args, **kwargs):
         with self.lock:
-            return super().execute_sql(sql, params, commit)
+            if self.revoked:
+                raise LocalProtocolError(
+                    "durable store is closed"
+                ) from self.commit_error
+            return super().execute_sql(*args, **kwargs)
 
-    def commit(self):
-        # A loop transaction began under the lock, so no worker commit is in
-        # flight: commit it without the lock.
-        if not self.commit_later:
-            super().commit()
+    def begin(self, lock_type=None):
+        # Peewee 4 begins through a cursor of its own, outside execute_sql.
+        self.execute_sql(f"BEGIN {lock_type}" if lock_type else "BEGIN")
 
     def _close(self, conn):
         with self.lock:
@@ -140,13 +144,16 @@ class DurableStore:
         # An acknowledged empty batch whose deletion the next commit writes.
         self._deferred_ack: int | None = None
         self._lease = FileLease(self.path)
-        self._commits = ThreadPoolExecutor(1, "nio-durable-commit")
+        self._commits: SimpleQueue[Callable[[], None] | None] = SimpleQueue()
         self.database = _Database(
             str(self.path),
             pragmas={"foreign_keys": 1, "secure_delete": "fast"},
             timeout=5,
         )
         try:
+            threading.Thread(
+                target=self._run_commits, name="nio-durable-commit", daemon=True
+            ).start()
             self.database.connect()
             tables = set(self.database.get_tables())
             if "nioingestmeta" in {table.lower() for table in tables}:
@@ -285,7 +292,7 @@ class DurableStore:
             raise LocalProtocolError("durable mutation requires a transaction")
 
     @contextmanager
-    def transaction(self) -> Iterator[None]:
+    def transaction(self, *, commit: bool = True) -> Iterator[None]:
         self._assert_open()
         if not self._transaction_depth and self.database.in_transaction():
             raise LocalProtocolError(
@@ -295,10 +302,13 @@ class DurableStore:
         self._invalidate_local_intent()
         try:
             outermost = self._transaction_depth == 1
-            with self.database.atomic("IMMEDIATE"):
+            with self.database.atomic("IMMEDIATE") as atomic:
                 if outermost and self._deferred_ack is not None:
                     self._save_ack(self._deferred_ack)
                 yield
+                if outermost and not commit:
+                    # transaction_async() commits it in the commit thread.
+                    setattr(atomic, "commit", lambda begin: None)
             if outermost:
                 self._deferred_ack = None
         except BaseException:
@@ -315,48 +325,49 @@ class DurableStore:
     async def transaction_async(self) -> AsyncIterator[None]:
         """Run a transaction whose commit waits for the disk off the event loop.
 
-        The loop keeps running while the worker commits, and the caller
-        resumes once the commit is durable. Nested in another transaction,
-        this one commits with it.
+        The body must not await. The loop keeps running while the commit
+        thread commits, and the caller resumes once the commit is durable. A
+        failed commit closes the store. Nested in another transaction, this
+        one commits with it.
         """
         if self._transaction_depth:
             with self.transaction():
                 yield
             return
-        held_ack = self._deferred_ack
-        self.database.commit_later = True
-        try:
-            with self.transaction():
-                yield
-        finally:
-            self.database.commit_later = False
+        with self.transaction(commit=False):
+            yield
+        done: Future[None] = Future()
         self.database.lock.acquire()
+        self._commits.put(partial(self._commit, done))
         try:
-            try:
-                done = asyncio.wrap_future(self._commits.submit(self._commit))
-            except RuntimeError:
-                # No new thread during interpreter shutdown: commit here.
-                self._commit()
-            else:
-                # A cancelled caller stops waiting, never the commit.
-                await asyncio.shield(done)
+            # A cancelled caller stops waiting, never the commit.
+            await asyncio.shield(asyncio.wrap_future(done))
+        except asyncio.CancelledError:
+            raise
         except BaseException:
-            # The commit failed, or may still land after a cancellation:
-            # reload what it changed, and hold its acknowledgement again.
-            self._deferred_ack = held_ack
-            self._room_metadata = None
-            self._loop_state = None
+            self.close()
             raise
 
-    def _commit(self) -> None:
-        """Commit the open transaction, then release the connection to the loop."""
+    def _run_commits(self) -> None:
+        while (commit := self._commits.get()) is not None:
+            commit()
+
+    def _commit(self, done: Future[None]) -> None:
+        """Commit in the commit thread, then hand the connection back to the loop."""
+        error = None
         try:
-            SqliteDatabase.commit(self.database)
-        except BaseException:
-            SqliteDatabase.rollback(self.database)
-            raise
-        finally:
-            self.database.lock.release()
+            self.database.commit()
+        except BaseException as failure:
+            # Loop code waiting for the connection may hold in-memory state,
+            # such as Olm sessions, that this commit would have saved: refuse
+            # it. Closing the connection rolls the transaction back.
+            error = self.database.commit_error = failure
+            self.database.revoked = True
+        self.database.lock.release()
+        if error is None:
+            done.set_result(None)
+        else:
+            done.set_exception(error)
 
     def load_room_metadata(self) -> dict[str, str]:
         self._assert_open()
@@ -594,8 +605,8 @@ class DurableStore:
             return
         async with self.transaction_async():
             self._save_ack(batch.sequence)
-        state.pending.popleft()
-        state.acked_sequence = batch.sequence
+            state.pending.popleft()
+            state.acked_sequence = batch.sequence
 
     def _save_ack(self, sequence: int) -> None:
         self.database.execute_sql(
@@ -615,7 +626,7 @@ class DurableStore:
         if not self.database.is_closed():
             self.database.close()
         self.database.revoked = True
-        self._commits.shutdown()
+        self._commits.put(None)
         self._closed = True
         self._loop_state = None
         self._lease.close()

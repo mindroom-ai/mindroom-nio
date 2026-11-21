@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from uuid import UUID
 
@@ -154,8 +155,13 @@ async def receive(mode, path):
 
         client._iter_sync = interrupted_prepare
     if mode == "during_commit":
-        # Die while the worker thread commits the captured response.
-        SqliteDatabase.commit = lambda database: kill_self()
+
+        def interrupted_commit(database):
+            # The commit thread dies as it starts committing the capture.
+            assert threading.current_thread() is not threading.main_thread()
+            kill_self()
+
+        SqliteDatabase.commit = interrupted_commit
     await session._accept_response(body)
     if mode == "after_prepare":
         kill_self()

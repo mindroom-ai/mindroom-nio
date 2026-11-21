@@ -796,8 +796,11 @@ class DurableSync:
 
     async def ack(self, batch: SyncBatch) -> None:
         self._assert_active()
-        await self._store.ack(batch)
-        self._changed.set()
+        try:
+            await self._store.ack(batch)
+        finally:
+            # A cancelled caller leaves the commit running; the runner still wakes.
+            self._changed.set()
 
     async def wait_for_work(self) -> None:
         self._assert_active()

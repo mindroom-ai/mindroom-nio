@@ -263,7 +263,7 @@ class Recovery:
             self._poison()
             raise
         finally:
-            # Waiters wake once the commit is durable.
+            # Wake waiters after the commit, never before it.
             session._changed.set()
 
     def _next_room(self, state: dict[str, Any], index: int) -> None:

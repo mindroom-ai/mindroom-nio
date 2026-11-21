@@ -437,8 +437,10 @@ async def test_cancelled_acknowledgement_still_commits_before_the_next_use(
         monkeypatch.setattr(SqliteDatabase, "commit", held)
         ack = asyncio.create_task(store.ack(batch))
         assert await asyncio.to_thread(started.wait, 5)
-        # Until the commit is durable, the loop still sees the batch queued.
-        assert (store.has_batches(), store.acked_sequence) == (True, 0)
+        # The in-memory queue already shows the acknowledgement, so a second
+        # acknowledgement of the same batch is a no-op.
+        assert (store.has_batches(), store.acked_sequence) == (False, batch.sequence)
+        await store.ack(batch)
         ack.cancel()
         with pytest.raises(asyncio.CancelledError):
             await ack
@@ -446,7 +448,7 @@ async def test_cancelled_acknowledgement_still_commits_before_the_next_use(
         # The next use of the connection waits for the commit the cancelled
         # caller left running, instead of reading or closing around it.
         if then == "read":
-            assert store.next_batch() is None
+            assert durable_ack(store) == (batch.sequence, 0)
             assert committed_ack(tmp_path) == batch.sequence
         store.close()
         assert committed_ack(tmp_path) == batch.sequence
@@ -455,14 +457,25 @@ async def test_cancelled_acknowledgement_still_commits_before_the_next_use(
 
 
 @pytest.mark.asyncio
-async def test_off_loop_transaction_commits_on_the_loop_without_a_worker(tmp_path):
+async def test_cancelling_a_queued_commit_still_commits_it(tmp_path):
     store = open_store(tmp_path)
     try:
         with store.transaction():
             batch = store.publish((message(),))
-        # The executor refuses new work, as at interpreter shutdown.
-        store._commits.shutdown()
-        await store.ack(batch)
-        assert committed_ack(tmp_path) == batch.sequence
+        busy, release = threading.Event(), threading.Event()
+        store._commits.put(lambda: busy.set() or release.wait(5))
+        assert await asyncio.to_thread(busy.wait, 5)
+        ack = asyncio.create_task(store.ack(batch))
+        await asyncio.sleep(0)
+        # Cancel while the commit waits behind other work in the commit thread.
+        ack.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await ack
+        release.set()
+        assert durable_ack(store) == (batch.sequence, 0)
+        # The commit thread survived the cancellation and runs the next job.
+        drained = threading.Event()
+        store._commits.put(drained.set)
+        assert await asyncio.to_thread(drained.wait, 5)
     finally:
         store.close()

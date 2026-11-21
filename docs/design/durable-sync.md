@@ -345,7 +345,10 @@ preparation, each recovered history page, completion, and each acknowledgement
 that commits) wait for the disk in one commit thread per store while the event
 loop keeps running. The caller resumes only once its commit is durable, and the
 thread holds the store's connection until then, so any other read or write on
-the loop waits for that commit instead of seeing or joining it. Rarer commits,
+the loop waits for that commit instead of seeing or joining it. A commit that
+fails there closes the store before the thread releases the connection, since
+loop code waiting for it may already hold in-memory state, such as Olm sessions,
+that the rollback cannot undo. Rarer commits,
 such as retained crypto requests, membership intents and `close()`, still
 commit on the loop. No database queue, serializer dependency, or generic retry
 framework is introduced. Whole-response JSON is decoded once per
