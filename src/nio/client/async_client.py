@@ -32,7 +32,6 @@ from collections.abc import (
     Iterator,
     Sequence,
 )
-from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial, wraps
@@ -2336,7 +2335,8 @@ class AsyncClient(Client):
                 if durable is None:
                     raise LocalProtocolError("durable sync detached during preparation")
                 # Recovery can record our leave before it removes the room.
-                durable._outbound._assert_joined(room_id)
+                if durable._metadata.get(room_id, {}).get("membership") != "join":
+                    raise LocalProtocolError(f"No longer joined to room {room_id}")
             if durable is not None and not durable._room_ready(room_id):
                 raise LocalProtocolError(
                     "room state must be established before plaintext sending"
@@ -2353,9 +2353,7 @@ class AsyncClient(Client):
                     if durable is not None:
                         recipients = list(room.users)
                 elif durable is not None:
-                    await durable._outbound.ensure_members(
-                        room_id, require_joined=retried
-                    )
+                    await durable._outbound.ensure_members(room_id)
                     recipients = durable._outbound.member_cache[room_id]
                 else:
                     await self.joined_members(room_id)
@@ -2366,8 +2364,6 @@ class AsyncClient(Client):
                     # If sync invalidated the recipients while we awaited keys
                     # or another caller's share, query keys for the new list.
                     if durable is not None:
-                        if retried:
-                            durable._outbound._assert_joined(room_id)
                         if recipients is not None and (
                             self.rooms.get(room_id) is not room
                             or room.members_synced != members_synced
@@ -2387,15 +2383,10 @@ class AsyncClient(Client):
                     if (event := self.sharing_session.get(room_id)) is not None:
                         await event.wait()
                     else:
-                        with (
-                            durable._outbound._share_retry(room_id)
-                            if retried and durable is not None
-                            else nullcontext()
-                        ):
-                            await self.share_group_session(
-                                room_id,
-                                ignore_unverified_devices=ignore_unverified_devices,
-                            )
+                        await self.share_group_session(
+                            room_id,
+                            ignore_unverified_devices=ignore_unverified_devices,
+                        )
             except RoomRecipientsChangedError:
                 # A single retry handles an intervening sync without spinning
                 # if the room's recipients keep changing.

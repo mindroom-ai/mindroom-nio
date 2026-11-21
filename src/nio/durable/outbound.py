@@ -6,7 +6,6 @@ import asyncio
 import json
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
 from ..api import Api
@@ -44,9 +43,6 @@ class OutboundCrypto:
         self.store = session._store
         self.crypto = session._crypto
         self.member_cache: dict[str, list[str] | None] = {}
-        self._share_retry_room: ContextVar[str | None] = ContextVar(
-            "durable_share_retry_room", default=None
-        )
         self.maintenance_due = bool(
             self.crypto.olm.wedged_devices
             or self.crypto.olm.key_request_devices_no_session
@@ -257,16 +253,8 @@ class OutboundCrypto:
             if self.member_cache.get(room_id) is None:
                 self.member_cache.pop(room_id, None)
 
-    def _assert_joined(self, room_id: str) -> None:
-        if self.session._metadata.get(room_id, {}).get("membership") != "join":
-            raise LocalProtocolError(f"No longer joined to room {room_id}")
-
-    async def ensure_members(
-        self, room_id: str, *, require_joined: bool = False
-    ) -> None:
+    async def ensure_members(self, room_id: str) -> None:
         async with self.session._crypto_lock:
-            if require_joined:
-                self._assert_joined(room_id)
             if room_id not in self.member_cache:
                 await self._joined_members(room_id)
 
@@ -284,19 +272,9 @@ class OutboundCrypto:
             message.request_id, message.session_id, message.room_id, message.algorithm
         )
 
-    @contextmanager
-    def _share_retry(self, room_id: str) -> Iterator[None]:
-        """Preserve retry-only joined checks across the public sharing method."""
-        token = self._share_retry_room.set(room_id)
-        try:
-            yield
-        finally:
-            self._share_retry_room.reset(token)
-
     async def share_group_session(
         self, room_id: str, ignore_unverified_devices: bool = False
     ) -> ShareGroupSessionResponse:
-        require_joined = self._share_retry_room.get() == room_id
         room = self.client.rooms.get(room_id)
         if room is None or not room.encrypted:
             raise LocalProtocolError("group sharing requires a joined encrypted room")
@@ -305,7 +283,7 @@ class OutboundCrypto:
         self.client.sharing_session[room_id] = asyncio.Event()
         try:
             if not room.members_synced:
-                await self.ensure_members(room_id, require_joined=require_joined)
+                await self.ensure_members(room_id)
             users = (
                 list(room.users) if room.members_synced else self.member_cache[room_id]
             )
@@ -313,11 +291,7 @@ class OutboundCrypto:
             if missing := self.crypto.olm.get_missing_sessions(users):
                 await self.keys_claim(missing)
             async with self.session._crypto_lock:
-                if require_joined:
-                    self._assert_joined(room_id)
                 await self._finish_pending()
-                if require_joined:
-                    self._assert_joined(room_id)
                 if (
                     self.client.rooms.get(room_id) is not room
                     or (

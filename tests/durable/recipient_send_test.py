@@ -314,10 +314,7 @@ async def test_room_send_retries_sliding_recipient_invalidation(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("leave_at", ["lookup", "retry-lock", "share-lock"])
-async def test_room_send_retry_stops_after_recovery_observes_own_leave(
-    tmp_path, monkeypatch, leave_at
-):
+async def test_room_send_retry_stops_after_recovery_observes_own_leave(tmp_path):
     peer = "@peer:example.org"
     lookups = 0
 
@@ -333,12 +330,7 @@ async def test_room_send_retry_stops_after_recovery_observes_own_leave(
         if request.path.endswith("/joined_members"):
             lookups += 1
             if lookups == 1:
-                if leave_at != "lookup":
-                    # Invalidate this lookup, then leave while the retry takes the lock.
-                    await session._accept_response(response(messages=0))
-                    await settle(session)
-                else:
-                    await observe_leave()
+                await observe_leave()
             return web.json_response({"joined": {USER: {}, peer: {}}})
         if request.path.endswith("/messages"):
             return web.json_response(
@@ -368,25 +360,6 @@ async def test_room_send_retry_stops_after_recovery_observes_own_leave(
                 nio_client.olm.tracked_users.add(peer)
                 nio_client.olm.outgoing_to_device_messages.clear()
                 session._crypto.capture()
-            if leave_at != "lookup":
-                acquire = session._crypto_lock.acquire
-
-                async def acquire_after_leave():
-                    at_retry_lookup = leave_at == "retry-lock" and lookups == 1
-                    at_share = (
-                        leave_at == "share-lock"
-                        and lookups == 2
-                        and ROOM in nio_client.sharing_session
-                    )
-                    if (at_retry_lookup or at_share) and session._metadata[ROOM][
-                        "membership"
-                    ] == "join":
-                        await observe_leave()
-                    return await acquire()
-
-                monkeypatch.setattr(
-                    session._crypto_lock, "acquire", acquire_after_leave
-                )
             with pytest.raises(LocalProtocolError, match="No longer joined"):
                 await nio_client.room_send(
                     ROOM, "m.room.message", {"msgtype": "m.notice", "body": "secret"}
@@ -394,7 +367,7 @@ async def test_room_send_retry_stops_after_recovery_observes_own_leave(
             assert not any(
                 "/send/" in path or "/sendToDevice/" in path for path, _ in requests
             )
-            assert lookups == (2 if leave_at == "share-lock" else 1)
+            assert lookups == 1
         finally:
             await session.close()
             await nio_client.close()
