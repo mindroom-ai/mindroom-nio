@@ -98,6 +98,7 @@ from ..exceptions import (
     RemoteProtocolError,
     RoomRecipientsChangedError,
     TransferCancelledError,
+    _NoKeyQueryRequired,
 )
 from ..monitors import TransferMonitor
 from ..responses import (
@@ -2358,7 +2359,13 @@ class AsyncClient(Client):
                 else:
                     await self.joined_members(room_id)
                 if (retried or not members_synced) and self.should_query_keys:
-                    await self.keys_query()
+                    try:
+                        await self.keys_query()
+                    except _NoKeyQueryRequired:
+                        if durable is None:
+                            raise
+                        # Durable discovery rechecked under the lock: maintenance
+                        # has already done the work this send was waiting for.
 
                 while True:
                     # If sync invalidated the recipients while we awaited keys

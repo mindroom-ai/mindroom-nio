@@ -21,6 +21,10 @@ class LocalProtocolError(ProtocolError):
     pass
 
 
+class _NoKeyQueryRequired(LocalProtocolError):
+    """No durable device-key discovery was needed after draining pending work."""
+
+
 class RoomRecipientsChangedError(LocalProtocolError):
     """A durable room's recipients or outbound session changed during preparation."""
 

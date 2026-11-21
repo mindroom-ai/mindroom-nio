@@ -142,6 +142,7 @@ async def test_room_send_uses_fresh_recipients_without_replacing_room_members(
     "race",
     [
         "duplicate-at-lookup",
+        "maintenance-at-retry-lookup",
         "leave-at-claim",
         "join-at-query",
         "join-after-retained-query",
@@ -177,6 +178,7 @@ async def test_room_send_retries_sliding_recipient_invalidation(
     }
     lookups = 0
     lookup_task = None
+    maintenance_task = None
     queries = []
     shares = []
     sent = []
@@ -204,14 +206,26 @@ async def test_room_send_retries_sliding_recipient_invalidation(
         )
 
     async def http(request):
-        nonlocal lookups, lookup_task
+        nonlocal lookups, lookup_task, maintenance_task
         if request.path.endswith("/joined_members"):
             lookups += 1
             joined = {user: {} for user in members}
             if (race == "repeated" and lookups <= 2) or (
-                race == "duplicate-at-lookup" and lookups == 1
+                race in ("duplicate-at-lookup", "maintenance-at-retry-lookup")
+                and lookups == 1
             ):
                 await sync(own_join, f"lookup-{lookups}")
+            if race == "maintenance-at-retry-lookup" and lookups == 2:
+                queued = asyncio.Event()
+
+                async def maintain():
+                    queued.set()
+                    await session._maintain_crypto()
+
+                # Maintenance queues for the crypto lock before the lookup
+                # completes, ahead of the sender's device discovery.
+                maintenance_task = asyncio.create_task(maintain())
+                await queued.wait()
             if race == "join-after-retained-query" and lookups == 1:
                 members.add(other)
                 await sync(other_join, "join")
@@ -313,6 +327,17 @@ async def test_room_send_retries_sliding_recipient_invalidation(
                     nio_client, "share_group_session", share_with_policy
                 )
 
+            query_calls = 0
+            if race == "maintenance-at-retry-lookup":
+                keys_query = nio_client.keys_query
+
+                async def track_keys_query():
+                    nonlocal query_calls
+                    query_calls += 1
+                    return await keys_query()
+
+                monkeypatch.setattr(nio_client, "keys_query", track_keys_query)
+
             async def send_notice():
                 return await nio_client.room_send(
                     ROOM,
@@ -365,6 +390,14 @@ async def test_room_send_retries_sliding_recipient_invalidation(
                 assert payload["algorithm"] == "m.megolm.v1.aes-sha2"
                 assert payload["ciphertext"]
                 assert "body" not in payload
+                if maintenance_task is not None:
+                    await maintenance_task
+                    assert len(queries) == 1 and recipient in queries[0]
+                    assert query_calls == 1
+                    with pytest.raises(
+                        LocalProtocolError, match="No key query required"
+                    ):
+                        await nio_client.keys_query()
             if pending_invite:
                 assert lookups == 1
             else:
@@ -372,6 +405,8 @@ async def test_room_send_retries_sliding_recipient_invalidation(
         finally:
             if lookup_task is not None:
                 await lookup_task
+            if maintenance_task is not None:
+                await maintenance_task
             await session.close()
             await nio_client.close()
 
