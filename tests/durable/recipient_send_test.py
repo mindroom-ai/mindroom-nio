@@ -142,7 +142,6 @@ async def test_room_send_uses_fresh_recipients_without_replacing_room_members(
     "race",
     [
         "duplicate-at-lookup",
-        "maintenance-at-retry-lookup",
         "query-fails-at-retry",
         "equal-lookups-with-already-shared-session",
         "leave-at-claim",
@@ -223,18 +222,9 @@ async def test_room_send_retries_sliding_recipient_invalidation(
             lookups += 1
             joined = {user: {} for user in members}
             if (race == "repeated" and lookups <= 2) or (
-                race
-                in (
-                    "duplicate-at-lookup",
-                    "maintenance-at-retry-lookup",
-                    "query-fails-at-retry",
-                )
-                and lookups == 1
+                race in ("duplicate-at-lookup", "query-fails-at-retry") and lookups == 1
             ):
                 await sync(own_join, f"lookup-{lookups}")
-            if race == "maintenance-at-retry-lookup" and lookups == 2:
-                # Queue maintenance behind the replacement lookup before it replies.
-                await start_task(session._maintain_crypto())
             if same_lookup and lookups == 2:
                 joined = dict(reversed(tuple(joined.items())))
             return web.json_response({"joined": joined})
@@ -401,13 +391,6 @@ async def test_room_send_retries_sliding_recipient_invalidation(
                 assert payload["algorithm"] == "m.megolm.v1.aes-sha2"
                 assert payload["ciphertext"]
                 assert "body" not in payload
-                if race == "maintenance-at-retry-lookup":
-                    await tasks[0]
-                    assert queries == [{USER, recipient}]
-                    with pytest.raises(
-                        LocalProtocolError, match="No key query required"
-                    ):
-                        await nio_client.keys_query()
             assert lookups == (0 if complete else 2)
         finally:
             await asyncio.gather(*tasks, return_exceptions=True)

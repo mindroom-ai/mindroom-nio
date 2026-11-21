@@ -98,7 +98,6 @@ from ..exceptions import (
     RemoteProtocolError,
     RoomRecipientsChangedError,
     TransferCancelledError,
-    _NoKeyQueryRequired,
 )
 from ..monitors import TransferMonitor
 from ..responses import (
@@ -2354,12 +2353,7 @@ class AsyncClient(Client):
                     else:
                         await self.joined_members(room_id)
                     if self.should_query_keys:
-                        try:
-                            await self.keys_query()
-                        except _NoKeyQueryRequired:
-                            if durable is None:
-                                raise
-                            # Maintenance already finished discovery under the lock.
+                        await self.keys_query()
 
                 # A share another caller started may end without sharing, for
                 # example when that caller is cancelled, so check again after it.
