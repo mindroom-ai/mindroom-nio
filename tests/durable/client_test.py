@@ -20,6 +20,8 @@ from nio.durable.codec import restore_event
 from nio.durable.model import RecordKind, SyncRecord
 from nio.exceptions import LocalProtocolError
 
+from .store_test import loop_waits_for_connection
+
 USER = "@alice:example.org"
 ROOM = "!room:example.org"
 CONSUMER = UUID("87a00a8b-3c97-4a11-8d90-35e7c6978a37")
@@ -592,4 +594,36 @@ async def test_cancelled_acknowledgement_still_wakes_the_runner(tmp_path, monkey
         assert session._changed.is_set()
     finally:
         release.set()
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_room_readiness_waits_for_the_commit_that_establishes_it(
+    tmp_path, monkeypatch
+):
+    session = open_session(tmp_path)
+    try:
+        await session._accept_response(response())
+        while batch := await session.next_batch():
+            await session.ack(batch)
+        session._metadata[ROOM]["baseline"] = False
+        ready = asyncio.create_task(session.wait_for_room_ready(ROOM))
+        await asyncio.sleep(0)
+        started, waited = threading.Event(), []
+        commit = SqliteDatabase.commit
+
+        def held(database):
+            started.set()
+            waited.append(loop_waits_for_connection())
+            return commit(database)
+
+        monkeypatch.setattr(SqliteDatabase, "commit", held)
+        async with session._store.transaction_async():
+            # As preparation does, establish the baseline before the commit,
+            # and let another task wake the waiter meanwhile.
+            session._metadata[ROOM]["baseline"] = True
+            session._changed.set()
+        assert await ready is True
+        assert waited == [True]
+    finally:
         await session.close()

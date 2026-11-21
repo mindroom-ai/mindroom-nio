@@ -283,6 +283,13 @@ class DurableStore:
             raise LocalProtocolError(
                 "durable store is closed or belongs to another process"
             )
+        # Wait for a commit in flight: until it is durable, nothing may read or
+        # build on what it wrote, including this store's mirrors of it.
+        with self.database.lock:
+            if self.database.revoked:
+                raise LocalProtocolError(
+                    "durable store is closed"
+                ) from self.database.commit_error
 
     def _require_transaction(self) -> None:
         self._assert_open()
@@ -307,7 +314,8 @@ class DurableStore:
                     self._save_ack(self._deferred_ack)
                 yield
                 if outermost and not commit:
-                    # transaction_async() commits it in the commit thread.
+                    # transaction_async() commits it in the commit thread. This
+                    # also skips peewee's after_commit callbacks; none are used.
                     setattr(atomic, "commit", lambda begin: None)
             if outermost:
                 self._deferred_ack = None
@@ -327,8 +335,8 @@ class DurableStore:
 
         The body must not await. The loop keeps running while the commit
         thread commits, and the caller resumes once the commit is durable. A
-        failed commit closes the store. Nested in another transaction, this
-        one commits with it.
+        failed commit closes the store, even after its caller was cancelled.
+        Nested in another transaction, this one commits with it.
         """
         if self._transaction_depth:
             with self.transaction():
@@ -337,16 +345,16 @@ class DurableStore:
         with self.transaction(commit=False):
             yield
         done: Future[None] = Future()
+        committed = asyncio.wrap_future(done)
+        committed.add_done_callback(self._after_commit)
         self.database.lock.acquire()
         self._commits.put(partial(self._commit, done))
-        try:
-            # A cancelled caller stops waiting, never the commit.
-            await asyncio.shield(asyncio.wrap_future(done))
-        except asyncio.CancelledError:
-            raise
-        except BaseException:
+        # A cancelled caller stops waiting, never the commit.
+        await asyncio.shield(committed)
+
+    def _after_commit(self, committed: asyncio.Future[None]) -> None:
+        if committed.exception() is not None:
             self.close()
-            raise
 
     def _run_commits(self) -> None:
         while (commit := self._commits.get()) is not None:

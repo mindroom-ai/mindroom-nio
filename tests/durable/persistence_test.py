@@ -3,7 +3,6 @@
 import asyncio
 import json
 import threading
-import time
 from contextlib import nullcontext
 
 import pytest
@@ -13,7 +12,7 @@ from nio.exceptions import LocalProtocolError
 
 from .client_test import ROOM, USER, open_session, response
 from .recovery_test import baseline
-from .store_test import message, open_store
+from .store_test import loop_waits_for_connection, message, open_store
 
 
 def observe_sql(monkeypatch, store):
@@ -213,8 +212,9 @@ async def test_failed_ack_commit_closes_the_store_and_keeps_the_batch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("waiter", ["transaction", "sql"])
 async def test_failed_off_loop_commit_closes_the_store_to_waiting_writers(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, waiter
 ):
     store = open_store(tmp_path)
     try:
@@ -222,11 +222,11 @@ async def test_failed_off_loop_commit_closes_the_store_to_waiting_writers(
             store.capture(b'{"next_batch":"s1"}')
             empty = store.publish((), completes_sync=True)
         await store.ack(empty)
-        started = threading.Event()
+        started, waited = threading.Event(), []
 
         def fail(database):
             started.set()
-            time.sleep(0.2)
+            waited.append(loop_waits_for_connection())
             raise RuntimeError("disk full")
 
         async def complete():
@@ -237,14 +237,18 @@ async def test_failed_off_loop_commit_closes_the_store_to_waiting_writers(
         monkeypatch.setattr(SqliteDatabase, "commit", fail)
         completion = asyncio.create_task(complete())
         assert await asyncio.to_thread(started.wait, 5)
-        # A writer on the loop waits for the failing commit; it must not then
-        # commit in-memory state that the rollback could not undo.
+        # Loop code waiting for the failing commit must not then read what it
+        # wrote, or commit in-memory state that the rollback could not undo.
         with pytest.raises(LocalProtocolError, match="closed"):
-            with store.transaction():
-                store.publish(())
+            if waiter == "sql":
+                store.database.execute_sql("SELECT 1")
+            else:
+                with store.transaction():
+                    store.publish(())
         with pytest.raises(RuntimeError, match="disk full"):
             await completion
         monkeypatch.undo()
+        assert waited == [True]
         with pytest.raises(LocalProtocolError, match="closed"):
             store.has_input()
     finally:

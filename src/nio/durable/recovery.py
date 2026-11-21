@@ -259,6 +259,10 @@ class Recovery:
                     and session._crypto.next_request() is None
                 ):
                     session._complete_input()
+        except asyncio.CancelledError:
+            # Only the shielded commit can be cancelled here, and it still
+            # lands, so the session stays usable for another run().
+            raise
         except BaseException:
             self._poison()
             raise
@@ -668,6 +672,8 @@ class Recovery:
                 else:
                     state["from"] = end
                 session._store.save_continuation(state)
+        except asyncio.CancelledError:
+            raise
         except BaseException:
             self._poison()
             raise

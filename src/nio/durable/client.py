@@ -144,6 +144,8 @@ class DurableSync:
         self.client._assert_not_disposed()
         if self._closed:
             raise LocalProtocolError("durable sync session is closed")
+        # Wait for a commit in flight before reading the state it changed.
+        self._store._assert_open()
 
     def _decode_response(
         self, body: bytes

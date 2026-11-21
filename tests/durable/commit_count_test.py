@@ -161,3 +161,43 @@ async def test_sync_cycle_commits_wait_for_the_disk_off_the_event_loop(
                     held.set_result(web.Response(body=b"{}"))
             await nio_client.close()
             await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_runner_cancelled_during_its_commit_can_run_again(tmp_path, monkeypatch):
+    started, release = threading.Event(), threading.Event()
+    commit = SqliteDatabase.commit
+
+    def held(database):
+        if threading.current_thread() is not threading.main_thread():
+            started.set()
+            assert release.wait(5)
+        return commit(database)
+
+    monkeypatch.setattr(SqliteDatabase, "commit", held)
+    sync, next_poll, answers = held_polls()
+    async with homeserver(sync) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        runner = asyncio.create_task(session.run())
+        try:
+            (await next_poll()).set_result(web.Response(body=response()))
+            assert await asyncio.to_thread(started.wait, 5)
+            # Cancel the runner while the capture commit waits for the disk.
+            runner.cancel()
+            await asyncio.gather(runner, return_exceptions=True)
+            release.set()
+            runner = asyncio.create_task(session.run())
+            records = await drain_sync(session)
+            assert [r.kind for r in records].count(RecordKind.TIMELINE) == 1
+            await next_poll()
+            assert session.cursor == "s1"
+        finally:
+            release.set()
+            await session.close()
+            for held_answer in answers:
+                if not held_answer.done():
+                    held_answer.set_result(web.Response(body=b"{}"))
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)

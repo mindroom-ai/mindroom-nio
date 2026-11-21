@@ -180,6 +180,56 @@ async def test_recovery_commits_wait_for_the_disk_off_the_event_loop(
 
 
 @pytest.mark.asyncio
+async def test_runner_cancelled_during_a_page_commit_can_run_again(
+    tmp_path, monkeypatch
+):
+    async def sync(request):
+        raise AssertionError("retained input must finish without polling")
+
+    async def history(request):
+        return web.json_response(
+            {"start": "s1", "end": "tail", "chunk": [message("$before")]}
+        )
+
+    async with homeserver(sync, membership=history) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        await baseline(session)
+        await session._maintain_crypto()
+        await session._capture_response(limited())
+        started, release = threading.Event(), threading.Event()
+        commit = SqliteDatabase.commit
+
+        def held(database):
+            if threading.current_thread() is not threading.main_thread():
+                started.set()
+                assert release.wait(5)
+            return commit(database)
+
+        monkeypatch.setattr(SqliteDatabase, "commit", held)
+        session._quiescing = True
+        runner = asyncio.create_task(session.run())
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            # Cancel the runner while the history page commit waits for the disk.
+            runner.cancel()
+            await asyncio.gather(runner, return_exceptions=True)
+            release.set()
+            runner = asyncio.create_task(session.run())
+            records = await drain_sync(session)
+            await runner
+            assert [
+                r.source["event_id"] for r in records if r.kind is RecordKind.TIMELINE
+            ] == ["$before", "$tail"]
+        finally:
+            release.set()
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_recovery_drains_page_before_fetch_and_restarts_at_committed_token(
     tmp_path,
 ):
