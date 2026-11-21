@@ -142,6 +142,10 @@ async def test_room_send_uses_fresh_recipients_without_replacing_room_members(
     "race",
     [
         "duplicate-at-lookup",
+        "maintenance-at-retry-lookup",
+        "maintenance-at-retry-with-complete-members",
+        "query-fails-at-retry",
+        "equal-lookups-with-already-shared-session",
         "leave-at-claim",
         "join-at-query",
         "join-at-claim-with-complete-members",
@@ -167,8 +171,23 @@ async def test_room_send_retries_sliding_recipient_invalidation(
         for user in (recipient, other)
     }
     lookups = 0
+    queries = []
     shares = []
     sent = []
+    tasks = []
+    same_lookup = race == "equal-lookups-with-already-shared-session"
+
+    async def start_task(coro):
+        started = asyncio.Event()
+
+        async def run():
+            started.set()
+            return await coro
+
+        task = asyncio.create_task(run())
+        tasks.append(task)
+        await started.wait()
+        return task
 
     async def sync(event, pos):
         await session._accept_response(window(pos=pos, initial=False, state=[event]))
@@ -176,6 +195,14 @@ async def test_room_send_retries_sliding_recipient_invalidation(
 
     async def query(request):
         requested = (await request.json())["device_keys"]
+        queries.append(set(requested))
+        if race == "query-fails-at-retry":
+            return web.json_response(
+                {"errcode": "M_FORBIDDEN", "error": "Denied"}, status=403
+            )
+        if same_lookup and len(queries) == 2:
+            # A new device-list notification makes a spurious retry observable.
+            nio_client.olm.users_for_key_query.add(recipient)
         if race == "join-at-query" and other not in members:
             assert other not in requested
             members.add(other)
@@ -196,9 +223,20 @@ async def test_room_send_retries_sliding_recipient_invalidation(
             lookups += 1
             joined = {user: {} for user in members}
             if (race == "repeated" and lookups <= 2) or (
-                race == "duplicate-at-lookup" and lookups == 1
+                race
+                in (
+                    "duplicate-at-lookup",
+                    "maintenance-at-retry-lookup",
+                    "query-fails-at-retry",
+                )
+                and lookups == 1
             ):
                 await sync(own_join, f"lookup-{lookups}")
+            if race == "maintenance-at-retry-lookup" and lookups == 2:
+                # Queue maintenance behind the replacement lookup before it replies.
+                await start_task(session._maintain_crypto())
+            if same_lookup and lookups == 2:
+                joined = dict(reversed(tuple(joined.items())))
             return web.json_response({"joined": joined})
         if request.path.endswith("/keys/claim"):
             requested = (await request.json())["one_time_keys"]
@@ -263,27 +301,58 @@ async def test_room_send_retries_sliding_recipient_invalidation(
             if complete:
                 await nio_client.keys_query()
                 nio_client.rooms[ROOM].members_synced = True
-            if race == "join-at-wait-with-complete-members":
+            if race in (
+                "join-at-wait-with-complete-members",
+                "maintenance-at-retry-with-complete-members",
+            ):
                 sharing = asyncio.Event()
                 nio_client.sharing_session[ROOM] = sharing
 
                 async def finish_share_after_join():
                     members.add(other)
                     await sync(other_join, "join")
+                    if race == "maintenance-at-retry-with-complete-members":
+                        lock = session._crypto_lock
+                        await lock.acquire()
+                        try:
+                            await start_task(session._maintain_crypto())
+                        finally:
+                            asyncio.get_running_loop().call_soon(lock.release)
                     nio_client.sharing_session.pop(ROOM).set()
 
                 monkeypatch.setattr(sharing, "wait", finish_share_after_join)
 
-            async def send_notice():
+            async def send_notice(tx_id="notice"):
                 return await nio_client.room_send(
                     ROOM,
                     "m.room.message",
                     {"msgtype": "m.notice", "body": "secret notice"},
-                    tx_id="notice",
+                    tx_id=tx_id,
                     ignore_unverified_devices=True,
                 )
 
-            if race == "repeated":
+            if same_lookup:
+                assert isinstance(await send_notice("first"), RoomSendResponse)
+                assert not nio_client.olm.should_share_group_session(ROOM)
+                nio_client.olm.users_for_key_query.add(recipient)
+                async with session._crypto_lock:
+                    sending = await start_task(send_notice())
+                    refresh = await start_task(nio_client.joined_members(ROOM))
+                assert isinstance(await sending, RoomSendResponse)
+                await refresh
+                assert queries == [{USER, recipient}, {recipient}]
+                assert shares == [{recipient}]
+                assert [path.rsplit("/", 2)[-2:] for path, _ in sent] == [
+                    ["m.room.encrypted", "first"],
+                    ["m.room.encrypted", "notice"],
+                ]
+                assert sent[0][1]["session_id"] == sent[1][1]["session_id"]
+            elif race == "query-fails-at-retry":
+                with pytest.raises(LocalProtocolError, match="status=403"):
+                    await send_notice()
+                assert queries == [{USER, recipient}]
+                assert not shares and not sent
+            elif race == "repeated":
                 with pytest.raises(RoomRecipientsChangedError):
                     await send_notice()
                 assert not shares and not sent
@@ -307,8 +376,20 @@ async def test_room_send_retries_sliding_recipient_invalidation(
                 assert payload["algorithm"] == "m.megolm.v1.aes-sha2"
                 assert payload["ciphertext"]
                 assert "body" not in payload
+                if race.startswith("maintenance-at-"):
+                    await tasks[0]
+                    assert queries == (
+                        [{USER, recipient}, {other}]
+                        if complete
+                        else [{USER, recipient}]
+                    )
+                    with pytest.raises(
+                        LocalProtocolError, match="No key query required"
+                    ):
+                        await nio_client.keys_query()
             assert lookups == (0 if complete else 2)
         finally:
+            await asyncio.gather(*tasks, return_exceptions=True)
             await session.close()
             await nio_client.close()
 

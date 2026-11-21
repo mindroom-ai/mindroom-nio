@@ -98,6 +98,7 @@ from ..exceptions import (
     RemoteProtocolError,
     RoomRecipientsChangedError,
     TransferCancelledError,
+    _NoKeyQueryRequired,
 )
 from ..monitors import TransferMonitor
 from ..responses import (
@@ -2358,20 +2359,25 @@ class AsyncClient(Client):
                 else:
                     await self.joined_members(room_id)
                 if (retried or not members_synced) and self.should_query_keys:
-                    await self.keys_query()
+                    try:
+                        await self.keys_query()
+                    except _NoKeyQueryRequired:
+                        if durable is None:
+                            raise
+                        # Maintenance already finished discovery under the lock.
 
                 while True:
                     # If sync invalidated the recipients while we awaited keys
                     # or another caller's share, query keys for the new list.
                     if durable is not None:
+                        cached = durable._outbound.member_cache.get(room_id)
                         if recipients is not None and (
                             self.rooms.get(room_id) is not room
                             or room.members_synced != members_synced
                             or (members_synced and recipients != list(room.users))
                             or (
                                 not members_synced
-                                and durable._outbound.member_cache.get(room_id)
-                                is not recipients
+                                and (cached is None or set(cached) != set(recipients))
                             )
                         ):
                             raise RoomRecipientsChangedError(
