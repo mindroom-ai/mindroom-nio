@@ -1,5 +1,6 @@
 """Fresh encryption recipients do not replace the durable room projection."""
 
+import asyncio
 import json
 
 import pytest
@@ -8,14 +9,29 @@ from aiohttp import web
 from unpaddedbase64 import decode_base64
 
 from nio.crypto import Olm
-from nio.exceptions import MembersSyncError
+from nio.exceptions import (
+    LocalProtocolError,
+    MembersSyncError,
+    RoomRecipientsChangedError,
+)
 from nio.responses import RoomSendResponse
 from nio.rooms import MatrixRoom
 from nio.store import SqliteMemoryStore
 
-from .client_test import ROOM, USER, client, open_session
+from .client_test import ROOM, USER, client, open_session, response
 from .crypto_test import publish_account, queue_dummy
+from .recovery_test import limited, member
 from .runner_test import homeserver
+from .sliding_test import settings, settle, window
+
+ENCRYPTION = {
+    "type": "m.room.encryption",
+    "state_key": "",
+    "sender": USER,
+    "event_id": "$encryption",
+    "origin_server_ts": 1,
+    "content": {"algorithm": "m.megolm.v1.aes-sha2"},
+}
 
 
 @pytest.mark.asyncio
@@ -115,6 +131,247 @@ async def test_room_send_uses_fresh_recipients_without_replacing_room_members(
                 "type": "m.room.message",
                 "content": {"msgtype": "m.text", "body": "fresh recipient secret"},
             }
+        finally:
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "race",
+    [
+        "duplicate-at-lookup",
+        "leave-at-claim",
+        "join-at-query",
+        "join-at-claim-with-complete-members",
+        "join-at-wait-with-complete-members",
+        "duplicate-at-share",
+        "repeated",
+    ],
+)
+async def test_room_send_retries_sliding_recipient_invalidation(
+    tmp_path, monkeypatch, race
+):
+    recipient, other = "@peer:example.org", "@other:example.org"
+    members = {USER, recipient}
+    own_join = member("$join", "join")
+    other_join = member("$other-join", "join", other)
+    state = [own_join, member("$peer", "join", recipient), ENCRYPTION]
+    if race == "leave-at-claim":
+        members.add(other)
+        state.append(other_join)
+    keys = {
+        user: Olm(user, "OTHER", SqliteMemoryStore(user, "OTHER")).share_keys()
+        for user in (recipient, other)
+    }
+    lookups = 0
+    shares = []
+    sent = []
+
+    async def sync(event, pos):
+        await session._accept_response(window(pos=pos, initial=False, state=[event]))
+        await settle(session)
+
+    async def query(request):
+        requested = (await request.json())["device_keys"]
+        if race == "join-at-query" and other not in members:
+            assert other not in requested
+            members.add(other)
+            await sync(other_join, "join")
+        return web.json_response(
+            {
+                "device_keys": {
+                    user: {"OTHER": keys[user]["device_keys"]} if user in keys else {}
+                    for user in requested
+                },
+                "failures": {},
+            }
+        )
+
+    async def http(request):
+        nonlocal lookups
+        if request.path.endswith("/joined_members"):
+            lookups += 1
+            joined = {user: {} for user in members}
+            if (race == "repeated" and lookups <= 2) or (
+                race == "duplicate-at-lookup" and lookups == 1
+            ):
+                await sync(own_join, f"lookup-{lookups}")
+            return web.json_response({"joined": joined})
+        if request.path.endswith("/keys/claim"):
+            requested = (await request.json())["one_time_keys"]
+            if race == "leave-at-claim" and other in members:
+                assert other in requested
+                members.remove(other)
+                await sync(member("$leave", "leave", other), "leave")
+            if race == "join-at-claim-with-complete-members" and other not in members:
+                members.add(other)
+                await sync(other_join, "join")
+            return web.json_response(
+                {
+                    "one_time_keys": {
+                        user: {"OTHER": keys[user]["one_time_keys"]}
+                        for user in requested
+                    },
+                    "failures": {},
+                }
+            )
+        if "/sendToDevice/m.room.encrypted/" in request.path:
+            shares.append(set((await request.json())["messages"]))
+            if race == "duplicate-at-share" and len(shares) == 1:
+                await sync(own_join, "during-share")
+            return web.json_response({})
+        if "/send/" in request.path:
+            sent.append((request.path, await request.json()))
+            return web.json_response({"event_id": "$sent"})
+        raise AssertionError(request.path)
+
+    async with homeserver(None, query=query, membership=http) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(
+            tmp_path,
+            nio_client,
+            config=settings(
+                room_subscriptions={
+                    ROOM: {"required_state": [["m.room.member", "$LAZY"]]}
+                }
+            ),
+        )
+        try:
+            await session._accept_response(window(state=state))
+            await settle(session)
+            complete = race.endswith("with-complete-members")
+            if complete:
+                await nio_client.keys_query()
+                nio_client.rooms[ROOM].members_synced = True
+            if race == "join-at-wait-with-complete-members":
+                sharing = asyncio.Event()
+                nio_client.sharing_session[ROOM] = sharing
+
+                async def finish_share_after_join():
+                    members.add(other)
+                    await sync(other_join, "join")
+                    nio_client.sharing_session.pop(ROOM).set()
+
+                monkeypatch.setattr(sharing, "wait", finish_share_after_join)
+
+            async def send_notice():
+                return await nio_client.room_send(
+                    ROOM,
+                    "m.room.message",
+                    {"msgtype": "m.notice", "body": "secret notice"},
+                    tx_id="notice",
+                    ignore_unverified_devices=True,
+                )
+
+            if race == "repeated":
+                with pytest.raises(RoomRecipientsChangedError):
+                    await send_notice()
+                assert not shares and not sent
+            else:
+                result = await send_notice()
+                assert isinstance(result, RoomSendResponse)
+                assert result.event_id == "$sent"
+                if race == "join-at-query" or complete:
+                    assert shares == [{recipient, other}]
+                elif race == "duplicate-at-share":
+                    assert shares == [{recipient}, {recipient}]
+                else:
+                    assert shares == [{recipient}]
+                [(path, payload)] = sent
+                assert path.endswith("/send/m.room.encrypted/notice")
+                assert payload["algorithm"] == "m.megolm.v1.aes-sha2"
+                assert payload["ciphertext"]
+                assert "body" not in payload
+            assert lookups == (0 if complete else 2)
+        finally:
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("leave_at", ["lookup", "retry-lock", "share-lock"])
+async def test_room_send_retry_stops_after_recovery_observes_own_leave(
+    tmp_path, monkeypatch, leave_at
+):
+    peer = "@peer:example.org"
+    lookups = 0
+
+    async def observe_leave():
+        await session._accept_response(limited(section="leave"))
+        await session._recovery.advance()
+        # Recovery has committed the leave but has not reached the tail.
+        assert session._metadata[ROOM]["membership"] == "leave"
+        assert nio_client.rooms[ROOM].encrypted
+
+    async def http(request):
+        nonlocal lookups
+        if request.path.endswith("/joined_members"):
+            lookups += 1
+            if lookups == 1:
+                if leave_at != "lookup":
+                    # Invalidate this lookup, then leave while the retry takes the lock.
+                    await session._accept_response(response(messages=0))
+                    await settle(session)
+                else:
+                    await observe_leave()
+            return web.json_response({"joined": {USER: {}, peer: {}}})
+        if request.path.endswith("/messages"):
+            return web.json_response(
+                {"start": "s1", "end": "tail", "chunk": [member("$leave", "leave")]}
+            )
+        if "/send/" in request.path:
+            return web.json_response({"event_id": "$sent"})
+        if "/sendToDevice/" in request.path:
+            return web.json_response({})
+        raise AssertionError(request.path)
+
+    async with homeserver(None, membership=http) as (url, requests):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        try:
+            initial = json.loads(response(messages=0))
+            initial["rooms"]["join"][ROOM]["state"]["events"].append(ENCRYPTION)
+            await session._accept_response(
+                json.dumps(initial).encode(), full_state=True
+            )
+            await settle(session)
+            with session._outbound.transaction():
+                publish_account(nio_client.olm)
+                _, device = queue_dummy(nio_client.olm, user_id=peer)
+                nio_client.verify_device(device)
+                nio_client.olm.tracked_users.add(peer)
+                nio_client.olm.outgoing_to_device_messages.clear()
+                session._crypto.capture()
+            if leave_at != "lookup":
+                acquire = session._crypto_lock.acquire
+
+                async def acquire_after_leave():
+                    at_retry_lookup = leave_at == "retry-lock" and lookups == 1
+                    at_share = (
+                        leave_at == "share-lock"
+                        and lookups == 2
+                        and ROOM in nio_client.sharing_session
+                    )
+                    if (at_retry_lookup or at_share) and session._metadata[ROOM][
+                        "membership"
+                    ] == "join":
+                        await observe_leave()
+                    return await acquire()
+
+                monkeypatch.setattr(
+                    session._crypto_lock, "acquire", acquire_after_leave
+                )
+            with pytest.raises(LocalProtocolError, match="No longer joined"):
+                await nio_client.room_send(
+                    ROOM, "m.room.message", {"msgtype": "m.notice", "body": "secret"}
+                )
+            assert not any(
+                "/send/" in path or "/sendToDevice/" in path for path, _ in requests
+            )
+            assert lookups == (2 if leave_at == "share-lock" else 1)
         finally:
             await session.close()
             await nio_client.close()

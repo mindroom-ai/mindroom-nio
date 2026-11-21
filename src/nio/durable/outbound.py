@@ -12,7 +12,11 @@ from ..api import Api
 from ..client.base_client import _SyncItem
 from ..event_builders import ToDeviceMessage
 from ..events import MegolmEvent, RoomKeyRequest
-from ..exceptions import LocalProtocolError, OlmUnverifiedDeviceError
+from ..exceptions import (
+    LocalProtocolError,
+    OlmUnverifiedDeviceError,
+    RoomRecipientsChangedError,
+)
 from ..responses import (
     ErrorResponse,
     JoinedMembersResponse,
@@ -228,7 +232,9 @@ class OutboundCrypto:
             if not isinstance(response, JoinedMembersResponse):
                 raise LocalProtocolError("invalid joined members response")
             if room_id not in self.member_cache:
-                raise LocalProtocolError("room membership changed during lookup")
+                raise RoomRecipientsChangedError(
+                    "room membership changed during lookup"
+                )
             users = [member.user_id for member in response.members]
             with self.transaction():
                 if previous is None or set(previous) != set(users):
@@ -247,8 +253,16 @@ class OutboundCrypto:
             if self.member_cache.get(room_id) is None:
                 self.member_cache.pop(room_id, None)
 
-    async def ensure_members(self, room_id: str) -> None:
+    def _assert_joined(self, room_id: str) -> None:
+        if self.session._metadata.get(room_id, {}).get("membership") != "join":
+            raise LocalProtocolError(f"No longer joined to room {room_id}")
+
+    async def ensure_members(
+        self, room_id: str, *, require_joined: bool = False
+    ) -> None:
         async with self.session._crypto_lock:
+            if require_joined:
+                self._assert_joined(room_id)
             if room_id not in self.member_cache:
                 await self._joined_members(room_id)
 
@@ -267,7 +281,11 @@ class OutboundCrypto:
         )
 
     async def share_group_session(
-        self, room_id: str, ignore_unverified_devices: bool = False
+        self,
+        room_id: str,
+        ignore_unverified_devices: bool = False,
+        *,
+        require_joined: bool = False,
     ) -> ShareGroupSessionResponse:
         room = self.client.rooms.get(room_id)
         if room is None or not room.encrypted:
@@ -277,7 +295,7 @@ class OutboundCrypto:
         self.client.sharing_session[room_id] = asyncio.Event()
         try:
             if not room.members_synced:
-                await self.ensure_members(room_id)
+                await self.ensure_members(room_id, require_joined=require_joined)
             users = (
                 list(room.users) if room.members_synced else self.member_cache[room_id]
             )
@@ -285,7 +303,11 @@ class OutboundCrypto:
             if missing := self.crypto.olm.get_missing_sessions(users):
                 await self.keys_claim(missing)
             async with self.session._crypto_lock:
+                if require_joined:
+                    self._assert_joined(room_id)
                 await self._finish_pending()
+                if require_joined:
+                    self._assert_joined(room_id)
                 if (
                     self.client.rooms.get(room_id) is not room
                     or (
@@ -294,7 +316,9 @@ class OutboundCrypto:
                     )
                     or (room.members_synced and users != list(room.users))
                 ):
-                    raise LocalProtocolError("room membership changed before sharing")
+                    raise RoomRecipientsChangedError(
+                        "room membership changed before sharing"
+                    )
                 olm = self.crypto.olm
                 shared_with: set[tuple[str, str]] = set()
                 chunks = olm.share_group_session_parallel(
@@ -325,14 +349,14 @@ class OutboundCrypto:
                     assert group is not None
                     await self._send(request)
                     if olm.outbound_group_sessions.get(room_id) is not group:
-                        raise LocalProtocolError(
+                        raise RoomRecipientsChangedError(
                             "outbound group session changed while sharing"
                         )
                     group.users_shared_with.update(recipients)
                     shared_with.update(recipients)
                 assert group is not None
                 if olm.outbound_group_sessions.get(room_id) is not group:
-                    raise LocalProtocolError(
+                    raise RoomRecipientsChangedError(
                         "outbound group session changed while sharing"
                     )
                 group.shared = True

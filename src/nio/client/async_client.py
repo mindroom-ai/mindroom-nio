@@ -96,6 +96,7 @@ from ..exceptions import (
     InsufficientRecursionDepthError,
     LocalProtocolError,
     RemoteProtocolError,
+    RoomRecipientsChangedError,
     TransferCancelledError,
 )
 from ..monitors import TransferMonitor
@@ -2274,8 +2275,10 @@ class AsyncClient(Client):
         This method also makes sure that the room members are fully synced and
         that keys are queried before sending messages to an encrypted room.
 
-        If encrypted state cannot be fully synced after a couple of retries,
-        this raises `SendRetryError`.
+        With durable sync, encryption preparation retries once if the room's
+        recipients are invalidated mid-preparation. If invalidated again,
+        it raises `RoomRecipientsChangedError`. The retry does not resend the
+        room event.
 
         Raises `LocalProtocolError` if the client isn't logged in.
         """
@@ -2321,39 +2324,84 @@ class AsyncClient(Client):
         the group session when it is missing, unshared or expired.
         """
         assert self.olm
-        try:
-            room = self.rooms[room_id]
-        except KeyError:
-            raise LocalProtocolError(f"No such room with id {room_id} found.")
+        retried = False
+        while True:
+            room = self.rooms.get(room_id)
+            if room is None:
+                raise LocalProtocolError(f"No such room with id {room_id} found.")
 
-        durable = self._durable_session
-        if durable is not None and not durable._room_ready(room_id):
-            raise LocalProtocolError(
-                "room state must be established before plaintext sending"
-            )
+            durable = self._durable_session
+            if retried:
+                if durable is None:
+                    raise LocalProtocolError("durable sync detached during preparation")
+                # Recovery can record our leave before it removes the room.
+                durable._outbound._assert_joined(room_id)
+            if durable is not None and not durable._room_ready(room_id):
+                raise LocalProtocolError(
+                    "room state must be established before plaintext sending"
+                )
+            if not room.encrypted:
+                if retried:
+                    raise LocalProtocolError(f"Room {room_id} is no longer encrypted")
+                return room
 
-        if room.encrypted:
-            if not room.members_synced:
-                if durable is not None:
-                    await durable._outbound.ensure_members(room_id)
+            try:
+                members_synced = room.members_synced
+                recipients = None
+                if members_synced:
+                    if durable is not None:
+                        recipients = list(room.users)
+                elif durable is not None:
+                    await durable._outbound.ensure_members(
+                        room_id, require_joined=retried
+                    )
+                    recipients = durable._outbound.member_cache[room_id]
                 else:
                     await self.joined_members(room_id)
-                if self.should_query_keys:
+                if (retried or not members_synced) and self.should_query_keys:
                     await self.keys_query()
 
-            # A share another caller started may end without sharing, for
-            # example when that caller is cancelled, so check again after it.
-            while self.olm.should_share_group_session(room_id):
-                try:
-                    event = self.sharing_session[room_id]
-                    await event.wait()
-                except KeyError:
-                    await self.share_group_session(
-                        room_id,
-                        ignore_unverified_devices=ignore_unverified_devices,
-                    )
-
-        return room
+                while True:
+                    # If sync invalidated the recipients while we awaited keys
+                    # or another caller's share, query keys for the new list.
+                    if durable is not None:
+                        if retried:
+                            durable._outbound._assert_joined(room_id)
+                        if recipients is not None and (
+                            self.rooms.get(room_id) is not room
+                            or room.members_synced != members_synced
+                            or (members_synced and recipients != list(room.users))
+                            or (
+                                not members_synced
+                                and durable._outbound.member_cache.get(room_id)
+                                is not recipients
+                            )
+                        ):
+                            raise RoomRecipientsChangedError(
+                                "room membership changed during encryption preparation"
+                            )
+                    # Another caller may cancel before its share completes.
+                    if not self.olm.should_share_group_session(room_id):
+                        return room
+                    if (event := self.sharing_session.get(room_id)) is not None:
+                        await event.wait()
+                    elif retried and durable is not None:
+                        await durable._outbound.share_group_session(
+                            room_id,
+                            ignore_unverified_devices=ignore_unverified_devices,
+                            require_joined=True,
+                        )
+                    else:
+                        await self.share_group_session(
+                            room_id,
+                            ignore_unverified_devices=ignore_unverified_devices,
+                        )
+            except RoomRecipientsChangedError:
+                # A single retry handles an intervening sync without spinning
+                # if the room's recipients keep changing.
+                if retried:
+                    raise
+                retried = True
 
     @logged_in_async
     @store_loaded
