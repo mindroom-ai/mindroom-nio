@@ -8,7 +8,6 @@ import pytest
 from nio.durable.transport import Transport
 
 from .client_test import client
-from .transport_test import nothing_to_sync
 
 
 @asynccontextmanager
@@ -54,9 +53,7 @@ async def test_truncated_response_body_is_retried_and_released():
         nio_client = client()
         nio_client.homeserver = url
         try:
-            result = await Transport(nio_client, 1024, nothing_to_sync).request(
-                "GET", "/sync"
-            )
+            result = await Transport(nio_client, 1024).request("GET", "/sync")
 
             assert result == b'{"ok": true}'
             assert attempt_count() == 2

@@ -751,3 +751,34 @@ async def test_a_failed_wal_fsync_poisons_the_session(tmp_path, monkeypatch):
     finally:
         await session.close()
         await nio_client.close()
+
+
+@pytest.mark.asyncio
+async def test_client_requests_wait_for_the_sync_of_durable_commits(tmp_path):
+    from aiohttp import web
+
+    from .runner_test import homeserver
+
+    durable_when_received = []
+
+    async def sync(request):
+        raise AssertionError("no sync expected")
+
+    async def typing(request):
+        durable_when_received.append(session._store._synced == session._store._commits)
+        return web.json_response({})
+
+    async with homeserver(sync, membership=typing) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        try:
+            await session._accept_response(response())
+            # As preparation does, establish the room's baseline unsynced.
+            with session._store.transaction(sync_later=True):
+                session._store.publish(())
+            await nio_client.room_typing(ROOM, typing_state=True)
+            assert durable_when_received == [True]
+        finally:
+            await session.close()
+            await nio_client.close()

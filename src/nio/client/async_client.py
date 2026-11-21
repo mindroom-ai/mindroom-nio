@@ -969,6 +969,9 @@ class AsyncClient(Client):
                 Overrides `AsyncClient.config.request_timeout` if not `None`.
         """
         assert self.client_session
+        if self._durable_session is not None:
+            # A request may depend on what durable sync has committed.
+            await self._durable_session._store.make_durable()
 
         request_headers = dict(headers) if headers is not None else {}
         if self.config.custom_headers is not None:

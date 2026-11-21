@@ -95,9 +95,7 @@ class DurableSync:
         self._local_lock = asyncio.Lock()
         self._source_ready = asyncio.Event()
         self._source_ready.set()
-        self._transport = Transport(
-            client, config.max_response_bytes, store.make_durable
-        )
+        self._transport = Transport(client, config.max_response_bytes)
         self._crypto = CryptoMaintenance(client, store)
         self._crypto.restore()
         self._outbound = OutboundCrypto(self)

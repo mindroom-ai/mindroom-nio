@@ -345,10 +345,10 @@ preparation, each history page, and completion) commit with `sync_later`:
 process crash at once, and `DurableStore.make_durable()` fsyncs the WAL in a
 worker thread, one fsync at a time for every such commit since the last. The
 runner waits for it after each capture, before transient callbacks; every
-request of the durable `Transport` (`/sync`, crypto requests, `/messages`, joined
-members, joins and leaves), `next_batch()`, `dispatch()`, `wait_for_room_ready()`,
-the position check of `change_membership()` and `export_keys()` wait for it
-first. It returns only when nothing is left to sync, and a failed fsync closes
+HTTP request of a client with a durable session (`AsyncClient.send`, which also
+carries the session's own `/sync`, crypto requests, `/messages`, joins and
+leaves), `next_batch()`, `dispatch()`, `wait_for_room_ready()`, the position
+check of `change_membership()` and `export_keys()` wait for it first. It returns only when nothing is left to sync, and a failed fsync closes
 the store and poisons the session, since the kernel may report a lost write
 only once. A store reopened after a crash syncs its WAL once before its first
 effect, and `close()` syncs it too, since a reader can keep the final
