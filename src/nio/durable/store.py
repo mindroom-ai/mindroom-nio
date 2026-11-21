@@ -112,8 +112,7 @@ class DurableStore:
         self._deferred_ack: int | None = None
         # Commits that skipped their fsync, and how many of them one covers.
         self._commits = self._synced = 0
-        self._syncing = asyncio.Lock()
-        self._sync_error: OSError | None = None
+        self._flush: asyncio.Future[None] | None = None
         self._wal_path: str | None = None
         self._wal_entry_synced = False
         self._lease = FileLease(self.path)
@@ -299,10 +298,10 @@ class DurableStore:
             self._loop_state = None
             raise
         finally:
-            if later:
-                self.database.execute_sql("PRAGMA synchronous=FULL")
             self._transaction_depth -= 1
             self._invalidate_local_intent()
+            if later and not self._closed:
+                self.database.execute_sql("PRAGMA synchronous=FULL")
 
     async def make_durable(self) -> None:
         """Wait, off the event loop, until every ``sync_later`` commit is synced.
@@ -310,23 +309,29 @@ class DurableStore:
         Call it before any effect outside the process that depends on such a
         commit. It returns only once nothing is left to sync, so code that
         reads the store right after it, without awaiting, sees durable state.
-        A failed fsync fails every later call.
+        A failed fsync closes the store.
         """
-        async with self._syncing:
-            while self._synced < self._commits:
-                self._assert_open()
-                if self._sync_error is not None:
-                    raise LocalProtocolError(
-                        "durable store could not sync its WAL"
-                    ) from self._sync_error
-                commits = self._commits
-                try:
-                    await asyncio.to_thread(self._fsync)
-                except OSError as error:
-                    # The kernel may report a lost write only once.
-                    self._sync_error = error
-                    raise
-                self._synced = commits
+        while self._synced < self._commits:
+            self._assert_open()
+            if self._flush is None:
+                self._flush = asyncio.ensure_future(self._sync(self._commits))
+            # A cancelled caller stops waiting, never the fsync or its outcome.
+            await asyncio.shield(self._flush)
+
+    async def _sync(self, commits: int) -> None:
+        try:
+            await asyncio.to_thread(self._fsync)
+        except OSError as error:
+            if self._closed:
+                raise LocalProtocolError("durable store is closed") from error
+            # The kernel may report a lost write only once, so no later fsync
+            # may certify these commits.
+            self.close()
+            raise
+        else:
+            self._synced = max(self._synced, commits)
+        finally:
+            self._flush = None
 
     def _fsync(self) -> None:
         assert self._wal_path is not None

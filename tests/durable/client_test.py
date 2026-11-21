@@ -12,6 +12,7 @@ from nio import (
     AsyncClient,
     AsyncClientConfig,
     Event,
+    PresenceEvent,
     RoomMessageText,
     TimelineEventProvenance,
 )
@@ -572,8 +573,10 @@ async def test_room_readiness_waits_for_the_sync_of_what_made_it(tmp_path, monke
     session = open_session(tmp_path)
     try:
         await session._accept_response(response())
-        # Preparation leaves its commit for make_durable() to sync.
+        session._metadata[ROOM]["baseline"] = False
+        # As preparation does, establish the baseline in a sync_later commit.
         with session._store.transaction(sync_later=True):
+            session._metadata[ROOM]["baseline"] = True
             session._store.publish(())
         synced = []
         fsync = os.fsync
@@ -611,3 +614,72 @@ async def test_room_readiness_does_not_answer_for_a_session_closed_meanwhile(
     finally:
         release.set()
         await session.close()
+
+
+def recorded_fsyncs(monkeypatch):
+    synced = []
+    fsync = os.fsync
+    monkeypatch.setattr(
+        os, "fsync", lambda fd: synced.append(os.fstat(fd).st_ino) or fsync(fd)
+    )
+    return synced
+
+
+@pytest.mark.asyncio
+async def test_answers_from_room_state_wait_for_its_sync(tmp_path, monkeypatch):
+    nio_client = client()
+    session = open_session(tmp_path, nio_client)
+    try:
+        await session._accept_response(response())
+        answers = {
+            "dispatch": lambda: session.dispatch(
+                SyncRecord(RecordKind.TIMELINE, ROOM, {}, route=None)
+            ),
+            "membership": lambda: session.change_membership(
+                operation_id=UUID(int=1),
+                room_id=ROOM,
+                previous_membership="leave",
+                previous_epoch=0,
+                current_membership="join",
+            ),
+            "export": lambda: nio_client.export_keys(
+                str(tmp_path / "keys.txt"), "passphrase", count=1
+            ),
+        }
+        for name, answer in answers.items():
+            with session._store.transaction(sync_later=True):
+                session._store.publish(())
+            synced = recorded_fsyncs(monkeypatch)
+            await answer()
+            assert os.stat(f"{session._store.path}-wal").st_ino in synced, name
+            monkeypatch.undo()
+    finally:
+        await session.close()
+        await nio_client.close()
+
+
+@pytest.mark.asyncio
+async def test_transient_callbacks_follow_the_sync_of_their_capture(tmp_path):
+    nio_client = client()
+    durable = []
+    nio_client.add_presence_callback(
+        lambda event: durable.append(session._store._synced == session._store._commits),
+        PresenceEvent,
+    )
+    session = open_session(tmp_path, nio_client)
+    try:
+        body = json.loads(response())
+        body["presence"] = {
+            "events": [
+                {
+                    "type": "m.presence",
+                    "sender": USER,
+                    "content": {"presence": "online"},
+                }
+            ]
+        }
+        await session._accept_response(json.dumps(body).encode())
+        assert durable == [True]
+    finally:
+        await session.close()
+        await nio_client.close()

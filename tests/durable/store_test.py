@@ -355,28 +355,74 @@ async def test_make_durable_returns_only_when_nothing_is_left_to_sync(
 
 
 @pytest.mark.asyncio
-async def test_a_failed_wal_fsync_fails_every_later_sync(tmp_path, monkeypatch):
+@pytest.mark.parametrize("waiter", ["awaited", "cancelled"])
+async def test_a_failed_wal_fsync_closes_the_store(tmp_path, monkeypatch, waiter):
     store = open_store(tmp_path)
     try:
         with store.transaction(sync_later=True):
             store.publish(())
+        await store.make_durable()
+        with store.transaction(sync_later=True):
+            store.publish(())
+        started, release = threading.Event(), threading.Event()
 
         def fail(fd):
+            started.set()
+            assert release.wait(5)
             raise OSError(errno.EIO, "lost write")
 
         monkeypatch.setattr(os, "fsync", fail)
-        with pytest.raises(OSError, match="lost write"):
-            await store.make_durable()
+        sync = asyncio.create_task(store.make_durable())
+        assert await asyncio.to_thread(started.wait, 5)
+        if waiter == "cancelled":
+            # The outcome still reaches the store without a waiter.
+            sync.cancel()
+            await asyncio.gather(sync, return_exceptions=True)
+            release.set()
+            async with asyncio.timeout(5):
+                while not store._closed:
+                    await asyncio.sleep(0.01)
+        else:
+            release.set()
+            with pytest.raises(OSError, match="lost write"):
+                await sync
         monkeypatch.undo()
-        # The kernel may not report the lost write again.
-        with pytest.raises(LocalProtocolError, match="could not sync"):
+        # The kernel may not report the lost write again; no later fsync may
+        # certify it.
+        with pytest.raises(LocalProtocolError, match="closed"):
             await store.make_durable()
     finally:
         store.close()
 
 
 @pytest.mark.asyncio
-async def test_the_wal_of_a_symlinked_database_is_synced(tmp_path):
+async def test_closing_during_a_wal_fsync_reports_a_closed_store(tmp_path, monkeypatch):
+    store = open_store(tmp_path)
+    try:
+        with store.transaction(sync_later=True):
+            store.publish(())
+        started, release = threading.Event(), threading.Event()
+        fsync = os.fsync
+
+        def held(fd):
+            # The first fsync is the directory's, before the WAL is opened.
+            started.set()
+            assert release.wait(5)
+            fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", held)
+        sync = asyncio.create_task(store.make_durable())
+        assert await asyncio.to_thread(started.wait, 5)
+        store.close()
+        release.set()
+        with pytest.raises(LocalProtocolError, match="closed"):
+            await sync
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_the_wal_of_a_symlinked_database_is_synced(tmp_path, monkeypatch):
     (tmp_path / "data").mkdir()
     (tmp_path / "store").mkdir()
     (tmp_path / "store" / "link.db").symlink_to(tmp_path / "data" / "real.db")
@@ -384,8 +430,14 @@ async def test_the_wal_of_a_symlinked_database_is_synced(tmp_path):
     try:
         with store.transaction(sync_later=True):
             store.publish(())
+        synced = []
+        fsync = os.fsync
+        monkeypatch.setattr(
+            os, "fsync", lambda fd: synced.append(os.fstat(fd).st_ino) or fsync(fd)
+        )
+        # SQLite keeps the WAL beside the file the symlink resolves to.
         await store.make_durable()
-        assert (tmp_path / "data" / "real.db-wal").exists()
+        assert synced[-1] == os.stat(tmp_path / "data" / "real.db-wal").st_ino
     finally:
         store.close()
 

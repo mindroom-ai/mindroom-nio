@@ -138,10 +138,10 @@ async def test_effects_wait_for_an_off_loop_wal_fsync(tmp_path, monkeypatch):
                     if batch.completes_sync:
                         break
             await next_poll()
-            # Commits fsync nothing on the loop. One WAL fsync off the loop
-            # covers the capture before its batch reaches the consumer, and
-            # one covers the acknowledgement and completion before the next
-            # batch; the next poll then has nothing left to sync.
+            # A WAL fsync off the loop covers the capture before its batch
+            # reaches the consumer, and another covers completion before the
+            # next batch; the acknowledgement between them is a FULL commit,
+            # and the next poll has nothing left to sync.
             assert events == [
                 ("durable", True),
                 ("delivered", False),

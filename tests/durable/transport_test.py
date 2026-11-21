@@ -140,15 +140,23 @@ async def test_request_waits_until_what_it_depends_on_is_durable():
     async with homeserver(sync) as (url, _):
         nio_client = client()
         nio_client.homeserver = url
+        sends = []
+        send = nio_client.send
+
+        async def recorded_send(*args, **kwargs):
+            sends.append(synced.is_set())
+            return await send(*args, **kwargs)
+
+        nio_client.send = recorded_send
         try:
             request = asyncio.create_task(
                 Transport(nio_client, 1024, make_durable).request("GET", "/sync")
             )
             for _ in range(20):
                 await asyncio.sleep(0)
-            assert received == []
+            assert (sends, received) == ([], [])
             synced.set()
             await request
         finally:
             await nio_client.close()
-    assert received == [True]
+    assert (sends, received) == ([True], [True])

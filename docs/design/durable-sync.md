@@ -346,14 +346,16 @@ process crash at once, and `DurableStore.make_durable()` fsyncs the WAL in a
 worker thread, one fsync at a time for every such commit since the last. The
 runner waits for it after each capture, before transient callbacks; every
 request of the durable `Transport` (`/sync`, crypto requests, `/messages`, joined
-members, joins and leaves), `next_batch()` and `wait_for_room_ready()` wait for
-it first. It returns only when nothing is left to sync, and a failed fsync fails
-every later call. Every other commit, including acknowledgements, device trust,
+members, joins and leaves), `next_batch()`, `dispatch()`, `wait_for_room_ready()`,
+the position check of `change_membership()` and `export_keys()` wait for it
+first. It returns only when nothing is left to sync, and a failed fsync closes
+the store, since the kernel may report a lost write only once. Every other commit, including acknowledgements, device trust,
 key-share decisions and the results of joins, leaves and crypto requests, stays
 FULL and is durable when its call returns. Until such an fsync, other tasks can
 read in-memory room and crypto state that a power loss would roll back; the
 server sends that interval again after a restart. WAL checkpoints still fsync on
-the loop, once every thousand or so written pages. Process-kill tests verify
+the loop, once every thousand or so written pages, and so can the first write
+after the WAL restarts. Process-kill tests verify
 crash atomicity; they do not simulate hardware failure. Application handoff
 requires its journal to synchronize admission before acknowledging nio; MindRoom
 already uses FULL for its SQLite writer. No claim covers lying storage, disk

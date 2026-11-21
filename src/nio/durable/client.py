@@ -411,6 +411,8 @@ class DurableSync:
     ) -> None:
         """Invoke one committed observation's callback without acknowledging it."""
         self._assert_active()
+        # The callback sees the current room projection.
+        await self._store.make_durable()
         if record.route is None:
             return
         room = None
@@ -645,19 +647,16 @@ class DurableSync:
         ``room_create()``, returns False at once.
         Raise ``LocalProtocolError`` if the session closes while waiting.
         """
-        self._assert_active()
-        while self._metadata.get(room_id, {}).get("membership") == "join":
+        while True:
+            # Answer only from durable state.
+            await self._store.make_durable()
+            self._assert_active()
+            if self._metadata.get(room_id, {}).get("membership") != "join":
+                return False
             if self._room_ready(room_id):
-                # Answer only from durable state: check again after the sync.
-                await self._store.make_durable()
-                self._assert_active()
-                if self._room_ready(room_id):
-                    return True
-                continue
+                return True
             self._changed.clear()
             await self._changed.wait()
-            self._assert_active()
-        return False
 
     async def change_membership(
         self,
@@ -689,6 +688,8 @@ class DurableSync:
         await self.wait_for_membership_idle()
         async with self._local_lock:
             self._assert_active()
+            # Compare against durable membership, not one still being synced.
+            await self._store.make_durable()
             if not self._local_position_matches(intent):
                 return False
             if self._read_local_intent() is not None:

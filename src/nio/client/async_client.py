@@ -3026,6 +3026,9 @@ class AsyncClient(Client):
 
         loop = asyncio.get_event_loop()
 
+        if self._durable_session is not None:
+            # Export only keys that survive power loss.
+            await self._durable_session._store.make_durable()
         inbound_group_store = self.store.load_inbound_group_sessions()
         export_keys = partial(
             self.olm.export_keys_static,
