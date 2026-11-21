@@ -2,9 +2,11 @@
 
 import asyncio
 import json
+import threading
 
 import pytest
 from aiohttp import web
+from peewee import SqliteDatabase
 
 from nio import TimelineEventProvenance
 from nio.durable import DurableSyncConfig
@@ -116,6 +118,55 @@ async def test_recovery_orders_tenures_and_resets_rejoin_projection(tmp_path):
             assert set(nio_client.rooms[ROOM].users) == {USER}
             assert session.cursor == "s2"
             assert len([p for p, _ in requests if p.endswith("/messages")]) == 1
+        finally:
+            await session.close()
+            await nio_client.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_commits_wait_for_the_disk_off_the_event_loop(
+    tmp_path, monkeypatch
+):
+    async def sync(request):
+        raise AssertionError("retained input must finish without polling")
+
+    async def history(request):
+        return web.json_response(
+            {"start": "s1", "end": "tail", "chunk": [message("$before")]}
+        )
+
+    async with homeserver(sync, membership=history) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        await baseline(session)
+        # Upload the new account's keys first: crypto requests commit on the loop.
+        await session._maintain_crypto()
+        connection = session._store.database.connection()
+        changes = [connection.total_changes]
+        on_loop = []
+        commit = SqliteDatabase.commit
+
+        def record(database):
+            if connection.total_changes > changes[-1]:
+                on_loop.append(threading.current_thread() is threading.main_thread())
+            changes.append(connection.total_changes)
+            return commit(database)
+
+        monkeypatch.setattr(SqliteDatabase, "commit", record)
+        await session._capture_response(limited())
+        session._quiescing = True
+        runner = asyncio.create_task(session.run())
+        try:
+            records = await drain_sync(session)
+            await runner
+            assert [
+                r.source["event_id"] for r in records if r.kind is RecordKind.TIMELINE
+            ] == ["$before", "$tail"]
+            # Capture, the history page, the tail, completion and every
+            # acknowledgement that writes commit in the worker thread.
+            assert len(on_loop) >= 5
+            assert not any(on_loop)
         finally:
             await session.close()
             await nio_client.close()

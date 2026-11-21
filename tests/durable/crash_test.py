@@ -10,6 +10,7 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
+from peewee import SqliteDatabase
 
 from nio import AsyncClient, AsyncClientConfig, RoomKeyEvent
 from nio.crypto import OlmDevice
@@ -152,6 +153,9 @@ async def receive(mode, path):
                 yield item
 
         client._iter_sync = interrupted_prepare
+    if mode == "during_commit":
+        # Die while the worker thread commits the captured response.
+        SqliteDatabase.commit = lambda database: kill_self()
     await session._accept_response(body)
     if mode == "after_prepare":
         kill_self()
@@ -245,6 +249,7 @@ def run_worker(mode, path):
         "healthy",
         "before_capture_commit",
         "during_prepare",
+        "during_commit",
         "after_prepare",
         "after_receive",
     ],

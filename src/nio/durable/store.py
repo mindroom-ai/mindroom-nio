@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import threading
 from collections import deque
-from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from collections.abc import AsyncIterator, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager, contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,12 +33,39 @@ from .model import SyncBatch, SyncRecord, decode_records, encode_json, encode_re
 
 
 class _Database(SqliteDatabase):
+    """One connection shared by the event loop and the store's commit worker.
+
+    A commit in the worker holds the lock until it is durable, so loop code
+    that reaches SQLite meanwhile waits for it instead of reading or joining
+    the transaction being committed.
+    """
+
     revoked = False
+    commit_later = False
+    """Leave the outermost transaction open for the commit worker."""
+
+    def __init__(self, database: str, **kwargs: Any) -> None:
+        super().__init__(database, thread_safe=False, check_same_thread=False, **kwargs)
+        self.lock = threading.Lock()
 
     def connect(self, reuse_if_open=False):
         if self.revoked:
             raise LocalProtocolError("durable store is closed")
         return super().connect(reuse_if_open)
+
+    def execute_sql(self, sql, params=None, commit=None):
+        with self.lock:
+            return super().execute_sql(sql, params, commit)
+
+    def commit(self):
+        # A loop transaction began under the lock, so no worker commit is in
+        # flight: commit it without the lock.
+        if not self.commit_later:
+            super().commit()
+
+    def _close(self, conn):
+        with self.lock:
+            super()._close(conn)
 
 
 @dataclass(slots=True)
@@ -110,6 +140,7 @@ class DurableStore:
         # An acknowledged empty batch whose deletion the next commit writes.
         self._deferred_ack: int | None = None
         self._lease = FileLease(self.path)
+        self._commits = ThreadPoolExecutor(1, "nio-durable-commit")
         self.database = _Database(
             str(self.path),
             pragmas={"foreign_keys": 1, "secure_delete": "fast"},
@@ -279,6 +310,53 @@ class DurableStore:
         finally:
             self._transaction_depth -= 1
             self._invalidate_local_intent()
+
+    @asynccontextmanager
+    async def transaction_async(self) -> AsyncIterator[None]:
+        """Run a transaction whose commit waits for the disk off the event loop.
+
+        The loop keeps running while the worker commits, and the caller
+        resumes once the commit is durable. Nested in another transaction,
+        this one commits with it.
+        """
+        if self._transaction_depth:
+            with self.transaction():
+                yield
+            return
+        held_ack = self._deferred_ack
+        self.database.commit_later = True
+        try:
+            with self.transaction():
+                yield
+        finally:
+            self.database.commit_later = False
+        self.database.lock.acquire()
+        try:
+            try:
+                done = asyncio.wrap_future(self._commits.submit(self._commit))
+            except RuntimeError:
+                # No new thread during interpreter shutdown: commit here.
+                self._commit()
+            else:
+                # A cancelled caller stops waiting, never the commit.
+                await asyncio.shield(done)
+        except BaseException:
+            # The commit failed, or may still land after a cancellation:
+            # reload what it changed, and hold its acknowledgement again.
+            self._deferred_ack = held_ack
+            self._room_metadata = None
+            self._loop_state = None
+            raise
+
+    def _commit(self) -> None:
+        """Commit the open transaction, then release the connection to the loop."""
+        try:
+            SqliteDatabase.commit(self.database)
+        except BaseException:
+            SqliteDatabase.rollback(self.database)
+            raise
+        finally:
+            self.database.lock.release()
 
     def load_room_metadata(self) -> dict[str, str]:
         self._assert_open()
@@ -493,7 +571,7 @@ class DurableStore:
         except (ValueError, TypeError, KeyError) as error:
             raise LocalProtocolError("invalid stored durable batch") from error
 
-    def ack(self, batch: SyncBatch) -> None:
+    async def ack(self, batch: SyncBatch) -> None:
         self._assert_open()
         if batch.stream_id != self.stream_id:
             raise LocalProtocolError("batch belongs to another durable stream")
@@ -514,10 +592,10 @@ class DurableStore:
             state.pending.popleft()
             state.acked_sequence = self._deferred_ack = batch.sequence
             return
-        with self.transaction():
+        async with self.transaction_async():
             self._save_ack(batch.sequence)
-            state.pending.popleft()
-            state.acked_sequence = batch.sequence
+        state.pending.popleft()
+        state.acked_sequence = batch.sequence
 
     def _save_ack(self, sequence: int) -> None:
         self.database.execute_sql(
@@ -537,6 +615,7 @@ class DurableStore:
         if not self.database.is_closed():
             self.database.close()
         self.database.revoked = True
+        self._commits.shutdown()
         self._closed = True
         self._loop_state = None
         self._lease.close()

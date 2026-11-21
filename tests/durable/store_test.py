@@ -1,9 +1,14 @@
 """Crash boundaries and ownership of the compact durable store."""
 
+import asyncio
 import shutil
+import sqlite3
+import threading
+from contextlib import closing
 from uuid import UUID
 
 import pytest
+from peewee import SqliteDatabase
 from vodozemac import LibolmPickleException
 
 from nio.crypto import DeviceStore, OlmAccount, OlmDevice, TrustState
@@ -84,19 +89,20 @@ def test_crypto_and_output_rollback_together(tmp_path):
         reopened.close()
 
 
-def test_ack_is_ordered_and_idempotent(tmp_path):
+@pytest.mark.asyncio
+async def test_ack_is_ordered_and_idempotent(tmp_path):
     store = open_store(tmp_path)
     try:
         with store.transaction():
             first = store.publish((message(),))
             second = store.publish((message("$two"),))
         with pytest.raises(LocalProtocolError, match="oldest"):
-            store.ack(second)
+            await store.ack(second)
         assert store.next_batch() == first
-        store.ack(first)
-        store.ack(first)
+        await store.ack(first)
+        await store.ack(first)
         assert store.next_batch() == second
-        store.ack(second)
+        await store.ack(second)
         assert store.next_batch() is None
     finally:
         store.close()
@@ -124,7 +130,8 @@ def test_pending_bytes_counts_utf8_not_characters(
         store.close()
 
 
-def test_pending_bytes_tracks_rollback_ack_and_reopen(tmp_path):
+@pytest.mark.asyncio
+async def test_pending_bytes_tracks_rollback_ack_and_reopen(tmp_path):
     store = open_store(tmp_path)
     try:
         with store.transaction():
@@ -135,7 +142,7 @@ def test_pending_bytes_tracks_rollback_ack_and_reopen(tmp_path):
                 assert store.pending_bytes == 4
                 raise RuntimeError("interrupted")
         assert store.pending_bytes == 2
-        store.ack(first)
+        await store.ack(first)
         assert store.pending_bytes == 0
         with store.transaction():
             store.publish(())
@@ -298,14 +305,15 @@ def trace(store):
     return statements
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("writer", ["transaction", "close"])
-def test_only_empty_batch_acknowledgement_joins_the_next_commit(tmp_path, writer):
+async def test_only_empty_batch_acknowledgement_joins_the_next_commit(tmp_path, writer):
     store = open_store(tmp_path / "store")
     try:
         with store.transaction():
             batch = store.publish((), completes_sync=True)
         statements = trace(store)
-        store.ack(batch)
+        await store.ack(batch)
         assert "COMMIT" not in statements
         assert durable_ack(store) == (batch.sequence - 1, 1)
         assert (store.has_batches(), store.next_batch()) == (False, None)
@@ -324,20 +332,21 @@ def test_only_empty_batch_acknowledgement_joins_the_next_commit(tmp_path, writer
     try:
         assert reopened.acked_sequence == batch.sequence
         assert reopened.has_batches() == (writer == "transaction")
-        reopened.ack(batch)
+        await reopened.ack(batch)
     finally:
         reopened.close()
     killed = open_store(tmp_path / "killed")
     try:
         assert killed.acked_sequence == batch.sequence - 1
         assert killed.next_batch() == batch
-        killed.ack(batch)
+        await killed.ack(batch)
         assert killed.next_batch() is None
     finally:
         killed.close()
 
 
-def test_acknowledgement_that_could_repeat_or_reorder_a_batch_commits_at_once(
+@pytest.mark.asyncio
+async def test_acknowledgement_that_could_repeat_or_reorder_a_batch_commits_at_once(
     tmp_path,
 ):
     store = open_store(tmp_path)
@@ -347,24 +356,27 @@ def test_acknowledgement_that_could_repeat_or_reorder_a_batch_commits_at_once(
             full = store.publish((message(),))
         statements = trace(store)
         # Another batch is queued: its delivery must not read the empty one.
-        store.ack(empty)
+        await store.ack(empty)
         assert statements.count("COMMIT") == 1
         assert durable_ack(store) == (empty.sequence, 1)
         assert store.next_batch() == full
         # Redelivery of a batch with records would repeat them.
-        store.ack(full)
+        await store.ack(full)
         assert statements.count("COMMIT") == 2
         assert durable_ack(store) == (full.sequence, 0)
     finally:
         store.close()
 
 
-def test_failed_transaction_keeps_a_deferred_acknowledgement_for_the_next(tmp_path):
+@pytest.mark.asyncio
+async def test_failed_transaction_keeps_a_deferred_acknowledgement_for_the_next(
+    tmp_path,
+):
     store = open_store(tmp_path)
     try:
         with store.transaction():
             batch = store.publish((), completes_sync=True)
-        store.ack(batch)
+        await store.ack(batch)
         progress = store.progress_generation
         with pytest.raises(RuntimeError, match="interrupted"):
             with store.transaction():
@@ -381,16 +393,76 @@ def test_failed_transaction_keeps_a_deferred_acknowledgement_for_the_next(tmp_pa
         store.close()
 
 
-def test_acknowledgement_inside_a_transaction_commits_with_it(tmp_path):
+@pytest.mark.asyncio
+async def test_acknowledgement_inside_a_transaction_commits_with_it(tmp_path):
     store = open_store(tmp_path)
     try:
         with store.transaction():
             batch = store.publish((), completes_sync=True)
         with store.transaction():
-            store.ack(batch)
+            await store.ack(batch)
             later = store.publish((message(),))
         # Deferring here would leave the acknowledged row ahead of the new one.
         assert durable_ack(store) == (batch.sequence, 1)
         assert store.next_batch() == later
+    finally:
+        store.close()
+
+
+def committed_ack(path):
+    """Read the acknowledgement another connection sees, as a crash leaves it."""
+    with closing(sqlite3.connect(next(path.glob("*.db")))) as connection:
+        return connection.execute(
+            "SELECT acked_sequence FROM NioDurableMeta"
+        ).fetchone()[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("then", ["read", "close"])
+async def test_cancelled_acknowledgement_still_commits_before_the_next_use(
+    tmp_path, monkeypatch, then
+):
+    store = open_store(tmp_path)
+    try:
+        with store.transaction():
+            batch = store.publish((message(),))
+        started, release = threading.Event(), threading.Event()
+        commit = SqliteDatabase.commit
+
+        def held(database):
+            started.set()
+            assert release.wait(5)
+            return commit(database)
+
+        monkeypatch.setattr(SqliteDatabase, "commit", held)
+        ack = asyncio.create_task(store.ack(batch))
+        assert await asyncio.to_thread(started.wait, 5)
+        # Until the commit is durable, the loop still sees the batch queued.
+        assert (store.has_batches(), store.acked_sequence) == (True, 0)
+        ack.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await ack
+        threading.Timer(0.2, release.set).start()
+        # The next use of the connection waits for the commit the cancelled
+        # caller left running, instead of reading or closing around it.
+        if then == "read":
+            assert store.next_batch() is None
+            assert committed_ack(tmp_path) == batch.sequence
+        store.close()
+        assert committed_ack(tmp_path) == batch.sequence
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_off_loop_transaction_commits_on_the_loop_without_a_worker(tmp_path):
+    store = open_store(tmp_path)
+    try:
+        with store.transaction():
+            batch = store.publish((message(),))
+        # The executor refuses new work, as at interpreter shutdown.
+        store._commits.shutdown()
+        await store.ack(batch)
+        assert committed_ack(tmp_path) == batch.sequence
     finally:
         store.close()

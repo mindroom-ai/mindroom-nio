@@ -340,8 +340,15 @@ and storage honor synchronization. Process-kill tests verify crash atomicity;
 they do not simulate hardware failure. Application handoff requires its journal
 to synchronize admission before acknowledging nio; MindRoom already uses FULL
 for its SQLite writer. No claim covers lying storage, disk loss, or unsynchronized
-consumer databases. No new writer thread, database queue, serializer dependency,
-or generic retry framework is introduced. Whole-response JSON is decoded once per
+consumer databases. The commits every sync cycle pays (capture with
+preparation, each recovered history page, completion, and each acknowledgement
+that commits) wait for the disk in one commit thread per store while the event
+loop keeps running. The caller resumes only once its commit is durable, and the
+thread holds the store's connection until then, so any other read or write on
+the loop waits for that commit instead of seeing or joining it. Rarer commits,
+such as retained crypto requests, membership intents and `close()`, still
+commit on the loop. No database queue, serializer dependency, or generic retry
+framework is introduced. Whole-response JSON is decoded once per
 preparation attempt; prepared batches are encoded once and read without repeated
 canonicalization. Diagnostics exclude message payloads, credentials, and keys.
 Response-validation logs contain the response class, exception class and schema
@@ -544,6 +551,11 @@ The consumer's root-preparation scheduling document records the comparisons.
 Keep the existing ownership split and FULL durability while measuring that path.
 A new writer, scheduler, persistent queue, codec dependency or weaker guarantee
 requires its own evidence; the scale ambition alone does not justify one.
+
+That evidence came later for the commit thread above: on a busy deployment,
+synchronous commits were the largest source of event-loop stalls, mostly one
+per sync response, and `scripts/bench_durable_commit_lag.py` reproduces them
+with a slow fsync. FULL durability is unchanged.
 
 Documentation follow-up verification: 700 tests passed with three skipped,
 mypy reported no issues in 58 source files, and all repository hooks passed.

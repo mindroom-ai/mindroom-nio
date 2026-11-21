@@ -463,7 +463,7 @@ class DurableSync:
                     ):
                         continue
                     await self._maintain_crypto()
-                    with self._store.transaction():
+                    async with self._store.transaction_async():
                         self._complete_input()
                     self._changed.set()
                     continue
@@ -796,7 +796,7 @@ class DurableSync:
 
     async def ack(self, batch: SyncBatch) -> None:
         self._assert_active()
-        self._store.ack(batch)
+        await self._store.ack(batch)
         self._changed.set()
 
     async def wait_for_work(self) -> None:
