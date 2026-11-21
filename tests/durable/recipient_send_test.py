@@ -86,6 +86,7 @@ async def test_room_send_uses_fresh_recipients_without_replacing_room_members(
         room = MatrixRoom(ROOM, USER, encrypted=True)
         room.add_member("@old:example.org", "Old", None)
         nio_client.rooms[ROOM] = room
+        session._metadata[ROOM] = {"membership": "join"}
         try:
             if operation == "room_send":
                 result = await nio_client.room_send(
@@ -143,6 +144,11 @@ async def test_room_send_uses_fresh_recipients_without_replacing_room_members(
         "duplicate-at-lookup",
         "leave-at-claim",
         "join-at-query",
+        "join-after-retained-query",
+        "retained-query-miss-with-complete-members",
+        "pending-invite-with-complete-members",
+        "disagreement-with-complete-members",
+        "retry-applies-share-policy",
         "join-at-claim-with-complete-members",
         "join-at-wait-with-complete-members",
         "duplicate-at-share",
@@ -157,14 +163,21 @@ async def test_room_send_retries_sliding_recipient_invalidation(
     own_join = member("$join", "join")
     other_join = member("$other-join", "join", other)
     state = [own_join, member("$peer", "join", recipient), ENCRYPTION]
-    if race == "leave-at-claim":
+    disagreement = race == "disagreement-with-complete-members"
+    if race == "leave-at-claim" or disagreement:
         members.add(other)
         state.append(other_join)
+    pending_invite = race == "pending-invite-with-complete-members"
+    if pending_invite:
+        state.append(member("$invite", "invite", other))
+    retained_miss = race == "retained-query-miss-with-complete-members"
     keys = {
         user: Olm(user, "OTHER", SqliteMemoryStore(user, "OTHER")).share_keys()
         for user in (recipient, other)
     }
     lookups = 0
+    lookup_task = None
+    queries = []
     shares = []
     sent = []
 
@@ -174,6 +187,7 @@ async def test_room_send_retries_sliding_recipient_invalidation(
 
     async def query(request):
         requested = (await request.json())["device_keys"]
+        queries.append(set(requested))
         if race == "join-at-query" and other not in members:
             assert other not in requested
             members.add(other)
@@ -183,13 +197,14 @@ async def test_room_send_retries_sliding_recipient_invalidation(
                 "device_keys": {
                     user: {"OTHER": keys[user]["device_keys"]} if user in keys else {}
                     for user in requested
+                    if not (retained_miss and len(queries) == 1 and user == recipient)
                 },
                 "failures": {},
             }
         )
 
     async def http(request):
-        nonlocal lookups
+        nonlocal lookups, lookup_task
         if request.path.endswith("/joined_members"):
             lookups += 1
             joined = {user: {} for user in members}
@@ -197,6 +212,9 @@ async def test_room_send_retries_sliding_recipient_invalidation(
                 race == "duplicate-at-lookup" and lookups == 1
             ):
                 await sync(own_join, f"lookup-{lookups}")
+            if race == "join-after-retained-query" and lookups == 1:
+                members.add(other)
+                await sync(other_join, "join")
             return web.json_response({"joined": joined})
         if request.path.endswith("/keys/claim"):
             requested = (await request.json())["one_time_keys"]
@@ -218,8 +236,22 @@ async def test_room_send_retries_sliding_recipient_invalidation(
             )
         if "/sendToDevice/m.room.encrypted/" in request.path:
             shares.append(set((await request.json())["messages"]))
-            if race == "duplicate-at-share" and len(shares) == 1:
+            if len(shares) == 1 and (
+                race in ("duplicate-at-share", "retry-applies-share-policy")
+                or disagreement
+            ):
                 await sync(own_join, "during-share")
+                if disagreement:
+                    # The leave is visible to /joined_members, not sync yet.
+                    members.remove(other)
+                    queued = asyncio.Event()
+
+                    async def lookup():
+                        queued.set()
+                        return await nio_client.joined_members(ROOM)
+
+                    lookup_task = asyncio.create_task(lookup())
+                    await queued.wait()
             return web.json_response({})
         if "/send/" in request.path:
             sent.append((request.path, await request.json()))
@@ -243,8 +275,15 @@ async def test_room_send_retries_sliding_recipient_invalidation(
             await settle(session)
             complete = race.endswith("with-complete-members")
             if complete:
-                await nio_client.keys_query()
+                if retained_miss:
+                    dirty = nio_client.olm.users_for_key_query | {recipient}
+                    with session._outbound.transaction():
+                        session._crypto.enqueue_query(dirty)
+                else:
+                    await nio_client.keys_query()
                 nio_client.rooms[ROOM].members_synced = True
+            if pending_invite:
+                await nio_client.joined_members(ROOM)
             if race == "join-at-wait-with-complete-members":
                 sharing = asyncio.Event()
                 nio_client.sharing_session[ROOM] = sharing
@@ -256,6 +295,24 @@ async def test_room_send_retries_sliding_recipient_invalidation(
 
                 monkeypatch.setattr(sharing, "wait", finish_share_after_join)
 
+            if race == "join-after-retained-query":
+                with session._outbound.transaction():
+                    session._crypto.enqueue_query({recipient})
+            if race == "retry-applies-share-policy":
+                share_group_session = nio_client.share_group_session
+                calls = 0
+
+                async def share_with_policy(room_id, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise LocalProtocolError("subclass denied key sharing")
+                    return await share_group_session(room_id, **kwargs)
+
+                monkeypatch.setattr(
+                    nio_client, "share_group_session", share_with_policy
+                )
+
             async def send_notice():
                 return await nio_client.room_send(
                     ROOM,
@@ -265,6 +322,21 @@ async def test_room_send_retries_sliding_recipient_invalidation(
                     ignore_unverified_devices=True,
                 )
 
+            if disagreement:
+                with pytest.raises(LocalProtocolError, match="disagrees"):
+                    await send_notice()
+                assert shares == [{recipient, other}]
+                assert not sent
+                assert lookups == 1
+                assert set(session._outbound.member_cache[ROOM]) == {USER, recipient}
+                assert set(nio_client.rooms[ROOM].users) == {USER, recipient, other}
+                return
+            if race == "retry-applies-share-policy":
+                with pytest.raises(LocalProtocolError, match="subclass denied"):
+                    await send_notice()
+                assert shares == [{recipient}]
+                assert not sent
+                return
             if race == "repeated":
                 with pytest.raises(RoomRecipientsChangedError):
                     await send_notice()
@@ -273,7 +345,16 @@ async def test_room_send_retries_sliding_recipient_invalidation(
                 result = await send_notice()
                 assert isinstance(result, RoomSendResponse)
                 assert result.event_id == "$sent"
-                if race == "join-at-query" or complete:
+                if race == "join-after-retained-query":
+                    assert len(queries) == 2
+                    assert queries[0] == {recipient}
+                    assert other in queries[1]
+                    assert shares == [{recipient, other}]
+                elif retained_miss:
+                    assert len(queries) == 2
+                    assert queries[1] == {recipient}
+                    assert shares == [{recipient}]
+                elif race == "join-at-query" or complete:
                     assert shares == [{recipient, other}]
                 elif race == "duplicate-at-share":
                     assert shares == [{recipient}, {recipient}]
@@ -284,8 +365,13 @@ async def test_room_send_retries_sliding_recipient_invalidation(
                 assert payload["algorithm"] == "m.megolm.v1.aes-sha2"
                 assert payload["ciphertext"]
                 assert "body" not in payload
-            assert lookups == (0 if complete else 2)
+            if pending_invite:
+                assert lookups == 1
+            else:
+                assert lookups == (0 if complete else 2)
         finally:
+            if lookup_task is not None:
+                await lookup_task
             await session.close()
             await nio_client.close()
 
@@ -420,6 +506,7 @@ async def test_recipient_refresh_rotates_only_for_changed_or_unknown_members(
         room = MatrixRoom(ROOM, USER, encrypted=True)
         room.add_member("@historical:example.org", "Historical", None)
         nio_client.rooms[ROOM] = room
+        session._metadata[ROOM] = {"membership": "join"}
         try:
             await nio_client.room_send(
                 ROOM, "m.room.message", {"msgtype": "m.text", "body": "before"}

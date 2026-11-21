@@ -176,6 +176,7 @@ async def test_unverified_group_share_leaves_session_usable(tmp_path):
         room.add_member(USER, "Alice", None)
         room.members_synced = True
         nio_client.rooms[ROOM] = room
+        session._metadata[ROOM] = {"membership": "join"}
         try:
             with pytest.raises(OlmUnverifiedDeviceError):
                 await nio_client.share_group_session(ROOM)
@@ -337,6 +338,7 @@ async def test_public_member_query_returns_error_without_reusing_recipients(
         room = MatrixRoom(ROOM, USER, encrypted=True)
         room.add_member(USER, "Alice", None)
         nio_client.rooms[ROOM] = room
+        session._metadata[ROOM] = {"membership": "join"}
         session._outbound.member_cache[ROOM] = [USER]
         try:
             result = await nio_client.joined_members(ROOM)
@@ -387,6 +389,7 @@ async def test_group_ciphertext_survives_cancel_and_restart(tmp_path):
         room.add_member(USER, "Alice", None)
         room.members_synced = True
         nio_client.rooms[ROOM] = room
+        session._metadata[ROOM] = {"membership": "join"}
         sharing = asyncio.create_task(nio_client.share_group_session(ROOM))
         try:
             async with asyncio.timeout(3):
@@ -440,6 +443,7 @@ async def test_invalidation_during_group_http_prevents_completion(tmp_path):
         room.add_member(USER, "Alice", None)
         room.members_synced = True
         nio_client.rooms[ROOM] = room
+        session._metadata[ROOM] = {"membership": "join"}
         try:
             with pytest.raises(LocalProtocolError, match="changed while sharing"):
                 await nio_client.share_group_session(ROOM)
@@ -630,6 +634,7 @@ async def test_cached_only_recipient_revocation_invalidates_group(tmp_path, revo
         room = MatrixRoom(ROOM, USER, encrypted=True)
         room.add_member("@old:example.org", "Old", None)
         nio_client.rooms[ROOM] = room
+        session._metadata[ROOM] = {"membership": "join"}
         try:
             await nio_client.share_group_session(ROOM)
             assert nio_client.olm.outbound_group_sessions[ROOM].shared
