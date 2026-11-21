@@ -16,7 +16,6 @@ from ..exceptions import (
     LocalProtocolError,
     OlmUnverifiedDeviceError,
     RoomRecipientsChangedError,
-    _NoKeyQueryRequired,
 )
 from ..responses import (
     ErrorResponse,
@@ -196,10 +195,8 @@ class OutboundCrypto:
     async def _keys_query(self, user_set: set[str] | None = None) -> KeysQueryResponse:
         response = await self._finish_pending()
         if not (self.crypto.olm.users_for_key_query if user_set is None else user_set):
-            if user_set is None:
-                if isinstance(response, KeysQueryResponse):
-                    return response
-                raise _NoKeyQueryRequired("No key query required.")
+            if user_set is None and isinstance(response, KeysQueryResponse):
+                return response
             raise LocalProtocolError("No key query required.")
         with self.transaction():
             request = self.crypto.enqueue_query(user_set)
