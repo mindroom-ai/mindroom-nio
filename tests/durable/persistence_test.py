@@ -1,18 +1,15 @@
 """Reduce repeated persistence work without changing committed observations."""
 
-import asyncio
 import json
-import threading
 from contextlib import nullcontext
 
 import pytest
-from peewee import SqliteDatabase
 
 from nio.exceptions import LocalProtocolError
 
 from .client_test import ROOM, USER, open_session, response
 from .recovery_test import baseline
-from .store_test import loop_waits_for_connection, message, open_store
+from .store_test import message, open_store
 
 
 def observe_sql(monkeypatch, store):
@@ -93,9 +90,8 @@ def loop_view(store):
     )
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("nested", [False, True])
-async def test_sync_loop_polls_read_no_sql_and_follow_commits_and_rollbacks(
+def test_sync_loop_polls_read_no_sql_and_follow_commits_and_rollbacks(
     tmp_path, monkeypatch, nested
 ):
     store = open_store(tmp_path)
@@ -122,14 +118,14 @@ async def test_sync_loop_polls_read_no_sql_and_follow_commits_and_rollbacks(
                     raise RuntimeError("rollback")
         assert loop_view(store) == (True, True, "s1", {}, 0, 1, None)
 
-        await store.ack(first)
+        store.ack(first)
         with store.transaction():
             store.save_continuation({"phase": "prepared"})
             second = store.publish(())
         statements.clear()
         assert loop_view(store) == (True, True, "s1", {"phase": "prepared"}, 1, 3, None)
         assert store.next_batch() == second
-        await store.ack(second)
+        store.ack(second)
         assert store.next_batch() is None
         assert not any(
             sql.startswith("SELECT") and "NioDurableMeta" in sql for sql in statements
@@ -184,80 +180,23 @@ def test_durable_writes_need_the_stores_own_transaction(tmp_path):
         store.close()
 
 
-@pytest.mark.asyncio
-async def test_failed_ack_commit_closes_the_store_and_keeps_the_batch(
-    tmp_path, monkeypatch
-):
+def test_failed_ack_commit_reloads_pending_batches(tmp_path, monkeypatch):
     store = open_store(tmp_path)
     try:
         with store.transaction():
             batch = store.publish((message(),))
+        commit = store.database.commit
 
-        def fail(database):
+        def fail():
             raise RuntimeError("disk full")
 
-        monkeypatch.setattr(SqliteDatabase, "commit", fail)
+        monkeypatch.setattr(store.database, "commit", fail)
         with pytest.raises(RuntimeError, match="disk full"):
-            await store.ack(batch)
-        monkeypatch.undo()
-        with pytest.raises(LocalProtocolError, match="closed"):
-            store.has_batches()
-    finally:
-        store.close()
-    store = open_store(tmp_path)
-    try:
-        assert (store.acked_sequence, store.next_batch()) == (0, batch)
-    finally:
-        store.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("waiter", ["transaction", "sql"])
-async def test_failed_off_loop_commit_closes_the_store_to_waiting_writers(
-    tmp_path, monkeypatch, waiter
-):
-    store = open_store(tmp_path)
-    try:
-        with store.transaction():
-            store.capture(b'{"next_batch":"s1"}')
-            empty = store.publish((), completes_sync=True)
-        await store.ack(empty)
-        started, waited = threading.Event(), []
-
-        def fail(database):
-            started.set()
-            waited.append(loop_waits_for_connection())
-            raise RuntimeError("disk full")
-
-        async def complete():
-            async with store.transaction_async():
-                store.finish_input()
-                store.publish((), completes_sync=True)
-
-        monkeypatch.setattr(SqliteDatabase, "commit", fail)
-        completion = asyncio.create_task(complete())
-        assert await asyncio.to_thread(started.wait, 5)
-        # Loop code waiting for the failing commit must not then read what it
-        # wrote, or commit in-memory state that the rollback could not undo.
-        with pytest.raises(LocalProtocolError, match="closed"):
-            if waiter == "sql":
-                store.database.execute_sql("SELECT 1")
-            else:
-                with store.transaction():
-                    store.publish(())
-        with pytest.raises(RuntimeError, match="disk full"):
-            await completion
-        monkeypatch.undo()
-        assert waited == [True]
-        with pytest.raises(LocalProtocolError, match="closed"):
-            store.has_input()
-    finally:
-        store.close()
-    store = open_store(tmp_path)
-    try:
-        # Neither the completion nor the acknowledgement it carried was kept.
-        assert (store.has_input(), store.acked_sequence) == (True, 0)
-        assert store.next_batch() == empty
+            store.ack(batch)
+        monkeypatch.setattr(store.database, "commit", commit)
+        assert store.has_batches()
+        assert store.acked_sequence == 0
+        assert store.next_batch() == batch
     finally:
         store.close()
 

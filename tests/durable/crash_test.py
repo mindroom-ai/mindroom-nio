@@ -6,12 +6,10 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 from pathlib import Path
 from uuid import UUID
 
 import pytest
-from peewee import SqliteDatabase
 
 from nio import AsyncClient, AsyncClientConfig, RoomKeyEvent
 from nio.crypto import OlmDevice
@@ -154,14 +152,6 @@ async def receive(mode, path):
                 yield item
 
         client._iter_sync = interrupted_prepare
-    if mode == "during_commit":
-
-        def interrupted_commit(database):
-            # The commit thread dies as it starts committing the capture.
-            assert threading.current_thread() is not threading.main_thread()
-            kill_self()
-
-        SqliteDatabase.commit = interrupted_commit
     await session._accept_response(body)
     if mode == "after_prepare":
         kill_self()
@@ -255,7 +245,6 @@ def run_worker(mode, path):
         "healthy",
         "before_capture_commit",
         "during_prepare",
-        "during_commit",
         "after_prepare",
         "after_receive",
     ],

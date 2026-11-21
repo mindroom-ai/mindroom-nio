@@ -12,6 +12,10 @@ from .client_test import client
 from .runner_test import homeserver
 
 
+async def nothing_to_sync():
+    pass
+
+
 @pytest.mark.asyncio
 async def test_rate_limit_retries_identical_body_without_leaking_credentials():
     bodies = []
@@ -30,7 +34,7 @@ async def test_rate_limit_retries_identical_body_without_leaking_credentials():
         nio_client = client()
         nio_client.homeserver = url
         try:
-            result = await Transport(nio_client, 1024).request(
+            result = await Transport(nio_client, 1024, nothing_to_sync).request(
                 "PUT", "/sync?access_token=secret", '{"exact": "body"}'
             )
             assert result == b'{"ok": true}'
@@ -55,7 +59,9 @@ async def test_repeated_server_failures_stop_after_bounded_retries():
         nio_client.homeserver = url
         try:
             with pytest.raises(LocalProtocolError) as failure:
-                await Transport(nio_client, 1024).request("GET", "/sync")
+                await Transport(nio_client, 1024, nothing_to_sync).request(
+                    "GET", "/sync"
+                )
             assert attempts == 5
             assert "payload-secret" not in str(failure.value)
             assert "503" in str(failure.value)
@@ -74,7 +80,9 @@ async def test_retry_delay_is_cancellable():
     async with homeserver(sync) as (url, _):
         nio_client = client()
         nio_client.homeserver = url
-        task = asyncio.create_task(Transport(nio_client, 1024).request("GET", "/sync"))
+        task = asyncio.create_task(
+            Transport(nio_client, 1024, nothing_to_sync).request("GET", "/sync")
+        )
         try:
             await received.wait()
             task.cancel()
@@ -107,7 +115,7 @@ async def test_connection_exhaustion_is_typed_and_preserves_cause(
 
     monkeypatch.setattr("nio.durable.transport.asyncio.sleep", no_delay)
     with pytest.raises(ConnectionRetriesExhausted) as caught:
-        await Transport(OfflineClient(), 1024).request(
+        await Transport(OfflineClient(), 1024, nothing_to_sync).request(
             "PUT", "/sync", '{"exact":"body"}'
         )
 
@@ -115,3 +123,24 @@ async def test_connection_exhaustion_is_typed_and_preserves_cause(
     assert str(caught.value) == "durable HTTP connection retries exhausted"
     assert caught.value.__cause__ is failure
     assert requests == [("PUT", "/sync", '{"exact":"body"}')] * 5
+
+
+@pytest.mark.asyncio
+async def test_request_waits_until_what_it_depends_on_is_durable():
+    order = []
+
+    async def sync(request):
+        order.append("request")
+        return web.json_response({"ok": True})
+
+    async def make_durable():
+        order.append("durable")
+
+    async with homeserver(sync) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        try:
+            await Transport(nio_client, 1024, make_durable).request("GET", "/sync")
+        finally:
+            await nio_client.close()
+    assert order == ["durable", "request"]

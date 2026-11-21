@@ -95,7 +95,9 @@ class DurableSync:
         self._local_lock = asyncio.Lock()
         self._source_ready = asyncio.Event()
         self._source_ready.set()
-        self._transport = Transport(client, config.max_response_bytes)
+        self._transport = Transport(
+            client, config.max_response_bytes, store.make_durable
+        )
         self._crypto = CryptoMaintenance(client, store)
         self._crypto.restore()
         self._outbound = OutboundCrypto(self)
@@ -144,8 +146,6 @@ class DurableSync:
         self.client._assert_not_disposed()
         if self._closed:
             raise LocalProtocolError("durable sync session is closed")
-        # Wait for a commit in flight before reading the state it changed.
-        self._store._assert_open()
 
     def _decode_response(
         self, body: bytes
@@ -389,6 +389,7 @@ class DurableSync:
 
     async def next_batch(self) -> SyncBatch | None:
         self._assert_active()
+        await self._store.make_durable()
         return self._store.next_batch()
 
     @property
@@ -465,7 +466,7 @@ class DurableSync:
                     ):
                         continue
                     await self._maintain_crypto()
-                    async with self._store.transaction_async():
+                    with self._store.transaction():
                         self._complete_input()
                     self._changed.set()
                     continue
@@ -645,6 +646,8 @@ class DurableSync:
         self._assert_active()
         while self._metadata.get(room_id, {}).get("membership") == "join":
             if self._room_ready(room_id):
+                # The caller may now send what this readiness allows.
+                await self._store.make_durable()
                 return True
             self._changed.clear()
             await self._changed.wait()
@@ -798,11 +801,8 @@ class DurableSync:
 
     async def ack(self, batch: SyncBatch) -> None:
         self._assert_active()
-        try:
-            await self._store.ack(batch)
-        finally:
-            # A cancelled caller leaves the commit running; the runner still wakes.
-            self._changed.set()
+        self._store.ack(batch)
+        self._changed.set()
 
     async def wait_for_work(self) -> None:
         self._assert_active()

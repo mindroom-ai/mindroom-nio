@@ -2,11 +2,11 @@
 
 import asyncio
 import json
+import os
 import threading
 
 import pytest
 from aiohttp import web
-from peewee import SqliteDatabase
 
 from nio.durable.model import RecordKind
 
@@ -98,23 +98,18 @@ async def test_idle_sync_cycle_commits_once(tmp_path, first, body, config):
 
 
 @pytest.mark.asyncio
-async def test_sync_cycle_commits_wait_for_the_disk_off_the_event_loop(
-    tmp_path, monkeypatch
-):
+async def test_effects_wait_for_an_off_loop_wal_fsync(tmp_path, monkeypatch):
     loop = asyncio.get_running_loop()
-    commit = SqliteDatabase.commit
+    fsync = os.fsync
     events = []
 
-    def slow_disk(database):
-        if threading.current_thread() is threading.main_thread():
-            return commit(database)
-        # This commit cannot finish until the event loop runs a callback.
+    def slow_disk(fd):
+        # This fsync cannot finish until the event loop runs a callback.
         ran = threading.Event()
         loop.call_soon_threadsafe(ran.set)
         waited = ran.wait(5)
-        result = commit(database)
+        fsync(fd)
         loop.call_soon_threadsafe(events.append, ("durable", waited))
-        return result
 
     sync, next_poll, answers = held_polls()
 
@@ -131,7 +126,7 @@ async def test_sync_cycle_commits_wait_for_the_disk_off_the_event_loop(
             (await next_poll()).set_result(web.Response(body=response()))
             await drain_sync(session)
             answer = await next_poll()
-            monkeypatch.setattr(SqliteDatabase, "commit", slow_disk)
+            monkeypatch.setattr(os, "fsync", slow_disk)
             events.clear()
             answer.set_result(web.Response(body=classic(1, "$new")))
             async with asyncio.timeout(5):
@@ -143,13 +138,13 @@ async def test_sync_cycle_commits_wait_for_the_disk_off_the_event_loop(
                     if batch.completes_sync:
                         break
             await next_poll()
-            # Preparation, the message's acknowledgement and completion each
-            # commit off the loop, and nothing reaches the consumer or the
-            # server before the commit it follows from is durable.
+            # Commits fsync nothing on the loop. One WAL fsync off the loop
+            # covers the capture before its batch reaches the consumer, and
+            # one covers the acknowledgement and completion before the next
+            # batch; the next poll then has nothing left to sync.
             assert events == [
                 ("durable", True),
                 ("delivered", False),
-                ("durable", True),
                 ("durable", True),
                 ("delivered", True),
                 ("poll",),
@@ -159,45 +154,5 @@ async def test_sync_cycle_commits_wait_for_the_disk_off_the_event_loop(
             for held in answers:
                 if not held.done():
                     held.set_result(web.Response(body=b"{}"))
-            await nio_client.close()
-            await asyncio.gather(runner, return_exceptions=True)
-
-
-@pytest.mark.asyncio
-async def test_runner_cancelled_during_its_commit_can_run_again(tmp_path, monkeypatch):
-    started, release = threading.Event(), threading.Event()
-    commit = SqliteDatabase.commit
-
-    def held(database):
-        if threading.current_thread() is not threading.main_thread():
-            started.set()
-            assert release.wait(5)
-        return commit(database)
-
-    monkeypatch.setattr(SqliteDatabase, "commit", held)
-    sync, next_poll, answers = held_polls()
-    async with homeserver(sync) as (url, _):
-        nio_client = client()
-        nio_client.homeserver = url
-        session = open_session(tmp_path, nio_client)
-        runner = asyncio.create_task(session.run())
-        try:
-            (await next_poll()).set_result(web.Response(body=response()))
-            assert await asyncio.to_thread(started.wait, 5)
-            # Cancel the runner while the capture commit waits for the disk.
-            runner.cancel()
-            await asyncio.gather(runner, return_exceptions=True)
-            release.set()
-            runner = asyncio.create_task(session.run())
-            records = await drain_sync(session)
-            assert [r.kind for r in records].count(RecordKind.TIMELINE) == 1
-            await next_poll()
-            assert session.cursor == "s1"
-        finally:
-            release.set()
-            await session.close()
-            for held_answer in answers:
-                if not held_answer.done():
-                    held_answer.set_result(web.Response(body=b"{}"))
             await nio_client.close()
             await asyncio.gather(runner, return_exceptions=True)

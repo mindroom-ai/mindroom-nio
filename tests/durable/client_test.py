@@ -2,11 +2,10 @@
 
 import asyncio
 import json
-import threading
+import os
 from uuid import UUID
 
 import pytest
-from peewee import SqliteDatabase
 
 from nio import (
     AsyncClient,
@@ -19,8 +18,6 @@ from nio.durable import DurableSyncConfig, open_durable_sync
 from nio.durable.codec import restore_event
 from nio.durable.model import RecordKind, SyncRecord
 from nio.exceptions import LocalProtocolError
-
-from .store_test import loop_waits_for_connection
 
 USER = "@alice:example.org"
 ROOM = "!room:example.org"
@@ -570,60 +567,15 @@ async def test_decrypted_state_never_changes_durable_membership(tmp_path, plaint
 
 
 @pytest.mark.asyncio
-async def test_cancelled_acknowledgement_still_wakes_the_runner(tmp_path, monkeypatch):
-    session = open_session(tmp_path)
-    started, release = threading.Event(), threading.Event()
-    try:
-        await session._accept_response(response())
-        batch = await session.next_batch()
-        commit = SqliteDatabase.commit
-
-        def held(database):
-            started.set()
-            assert release.wait(5)
-            return commit(database)
-
-        monkeypatch.setattr(SqliteDatabase, "commit", held)
-        session._changed.clear()
-        ack = asyncio.create_task(session.ack(batch))
-        assert await asyncio.to_thread(started.wait, 5)
-        ack.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await ack
-        # The commit still lands, so a runner waiting for this batch must wake.
-        assert session._changed.is_set()
-    finally:
-        release.set()
-        await session.close()
-
-
-@pytest.mark.asyncio
-async def test_room_readiness_waits_for_the_commit_that_establishes_it(
-    tmp_path, monkeypatch
-):
+async def test_room_readiness_follows_the_fsync_of_its_baseline(tmp_path, monkeypatch):
+    synced = []
+    fsync = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd) or fsync(fd))
     session = open_session(tmp_path)
     try:
         await session._accept_response(response())
-        while batch := await session.next_batch():
-            await session.ack(batch)
-        session._metadata[ROOM]["baseline"] = False
-        ready = asyncio.create_task(session.wait_for_room_ready(ROOM))
-        await asyncio.sleep(0)
-        started, waited = threading.Event(), []
-        commit = SqliteDatabase.commit
-
-        def held(database):
-            started.set()
-            waited.append(loop_waits_for_connection())
-            return commit(database)
-
-        monkeypatch.setattr(SqliteDatabase, "commit", held)
-        async with session._store.transaction_async():
-            # As preparation does, establish the baseline before the commit,
-            # and let another task wake the waiter meanwhile.
-            session._metadata[ROOM]["baseline"] = True
-            session._changed.set()
-        assert await ready is True
-        assert waited == [True]
+        assert synced == []
+        assert await session.wait_for_room_ready(ROOM)
+        assert synced[-1] == session._store._wal
     finally:
         await session.close()

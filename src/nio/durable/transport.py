@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -35,9 +36,16 @@ class ResponseTooLarge(LocalProtocolError):
 
 
 class Transport:
-    def __init__(self, client: AsyncClient, max_bytes: int):
+    def __init__(
+        self,
+        client: AsyncClient,
+        max_bytes: int,
+        make_durable: Callable[[], Awaitable[None]],
+    ):
         self.client = client
         self.max_bytes = max_bytes
+        # Every request may depend on what the session committed so far.
+        self.make_durable = make_durable
 
     async def request(
         self,
@@ -55,6 +63,7 @@ class Transport:
             if key != "access_token"
         ]
         path = urlunsplit(parts._replace(query=urlencode(query)))
+        await self.make_durable()
         for attempt in range(5):
             delay = min(0.5 * 2**attempt, 30.0)
             try:

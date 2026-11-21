@@ -88,9 +88,8 @@ For each response:
    The acknowledgement of an empty batch that is the only one queued, such as
    an idle sync's completion marker, takes no commit of its own: it holds in
    memory and the next transaction, or `close()`, writes it. If that
-   transaction fails before its commit, the acknowledgement stays held for the
-   one after; if its commit fails, the store closes. A crash or failed commit
-   before that write redelivers the empty batch, as a crash before the
+   transaction fails, the acknowledgement stays held for the one after. A
+   crash before that write redelivers the empty batch, as a crash before the
    acknowledgement does (step 4), so a restarted consumer can be given a
    completion marker before the session's first request: completion of a
    replayed batch does not show that this process has received a response.
@@ -331,32 +330,30 @@ unmerged prototype formats are unsupported. Normal schema version, identity,
 foreign-key, and decoded-data validation remain. Import without `fcntl` works;
 using ownership without supported locking fails clearly.
 
-Durable SQLite uses WAL with `synchronous=FULL`. Measured batch preparation,
-delivery and acknowledgement for 200 encrypted events took 52.9 ms with NORMAL
-and 61.5 ms with FULL; 1,000 took 270.4 ms and 280.9 ms. That small cost buys
-SQLite's commit synchronization rather than an application protocol. According
-to [SQLite's synchronous documentation](https://sqlite.org/pragma.html#pragma_synchronous),
-WAL/FULL preserves committed transactions across power loss when the filesystem
-and storage honor synchronization. Process-kill tests verify crash atomicity;
-they do not simulate hardware failure. Application handoff requires its journal
-to synchronize admission before acknowledging nio; MindRoom already uses FULL
-for its SQLite writer. No claim covers lying storage, disk loss, or unsynchronized
-consumer databases. The commits every sync cycle pays (capture with
-preparation, each recovered history page, completion, and each acknowledgement
-that commits) wait for the disk in one commit thread per store while the event
-loop keeps running. The caller resumes only once its commit is durable, and the
-thread holds the store's connection until then, so any other read or write on
-the loop, including a read of the store's in-memory mirror of committed rows,
-blocks until that commit is durable instead of seeing or joining it. A commit
-that fails there revokes the connection before the thread releases it, since
-loop code waiting for it may already hold in-memory state, such as Olm sessions,
-that the rollback cannot undo, and the store then closes, even when the caller
-was cancelled. Reopening it redelivers what that commit would have
-acknowledged. A caller cancelled during the commit stops waiting, but the
-commit still lands, so the session can run again. Rarer commits,
-such as retained crypto requests, membership intents and `close()`, still
-commit on the loop. No database queue, serializer dependency, or generic retry
-framework is introduced. Whole-response JSON is decoded once per
+Durable SQLite uses WAL with `synchronous=NORMAL`, and an fsync of the WAL
+off the event loop before any effect outside the process that depends on a
+commit. A NORMAL commit writes the WAL without waiting for the disk, so it
+survives a process crash at once. `DurableStore.make_durable()` then fsyncs the
+WAL in a worker thread, once for all commits since the last fsync, so they also
+survive power loss. Every HTTP request of the durable session (`/sync` with a
+new cursor, crypto requests, `/messages`, joins and leaves) waits for it in
+`Transport`, a batch reaches the consumer through `next_batch()` only after
+it, and `wait_for_room_ready()` returns only after it. Before this, commits
+used `synchronous=FULL`, and each one fsynced on the event loop, which on a busy
+deployment was the largest source of event-loop stalls (see
+`scripts/bench_durable_commit_lag.py`). What stays exposed to power loss is
+only in-process state the application reads directly, such as room state or a
+decryption, until the next of those effects; the server sends the same interval
+again after a restart. WAL checkpoints still fsync on the loop, once every
+thousand or so written pages. According to
+[SQLite's synchronous documentation](https://sqlite.org/pragma.html#pragma_synchronous),
+a synchronized WAL preserves committed transactions across power loss when the
+filesystem and storage honor synchronization. Process-kill tests verify crash
+atomicity; they do not simulate hardware failure. Application handoff requires
+its journal to synchronize admission before acknowledging nio; MindRoom already
+uses FULL for its SQLite writer. No claim covers lying storage, disk loss, or
+unsynchronized consumer databases. No database queue, serializer dependency, or
+generic retry framework is introduced. Whole-response JSON is decoded once per
 preparation attempt; prepared batches are encoded once and read without repeated
 canonicalization. Diagnostics exclude message payloads, credentials, and keys.
 Response-validation logs contain the response class, exception class and schema
@@ -548,7 +545,8 @@ None of these was adopted for startup. Combining capture and preparation commits
 and completing an empty cycle in that same commit, was adopted later for
 steady-state cost: every sync cycle commits once less, and an empty cycle that
 preparation completes (step 2 above) commits twice (preparation and
-acknowledgement) instead of four times, each commit an fsync on the event loop.
+acknowledgement) instead of four times, each commit then an fsync on the event
+loop.
 Writing an empty batch's acknowledgement with the next commit (step 3) then
 left an idle cycle one commit, and every other cycle one commit less again.
 Full-run sampling found Nio's synchronous commits on the main thread, but that
@@ -556,14 +554,9 @@ is a blocking location, not proof of the exact startup critical path. The
 remaining limit is unresolved.
 The consumer's root-preparation scheduling document records the comparisons.
 
-Keep the existing ownership split and FULL durability while measuring that path.
+Keep the existing ownership split and durability while measuring that path.
 A new writer, scheduler, persistent queue, codec dependency or weaker guarantee
 requires its own evidence; the scale ambition alone does not justify one.
-
-That evidence came later for the commit thread above: on a busy deployment,
-synchronous commits were the largest source of event-loop stalls, mostly one
-per sync response, and `scripts/bench_durable_commit_lag.py` reproduces them
-with a slow fsync. FULL durability is unchanged.
 
 Documentation follow-up verification: 700 tests passed with three skipped,
 mypy reported no issues in 58 source files, and all repository hooks passed.
