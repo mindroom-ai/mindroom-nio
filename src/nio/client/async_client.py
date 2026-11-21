@@ -2280,8 +2280,7 @@ class AsyncClient(Client):
         it raises `RoomRecipientsChangedError`. The retry does not resend the
         room event.
 
-        Raises `LocalProtocolError` if the client isn't logged in or durable
-        preparation can no longer confirm joined membership or recipients.
+        Raises `LocalProtocolError` if the client isn't logged in.
         """
         uuid: str | UUID = tx_id or uuid4()
 
@@ -2353,7 +2352,9 @@ class AsyncClient(Client):
                     if durable is not None:
                         recipients = list(room.users)
                 elif durable is not None:
-                    await durable._outbound.ensure_members(room_id)
+                    await durable._outbound.ensure_members(
+                        room_id, require_joined=retried
+                    )
                     recipients = durable._outbound.member_cache[room_id]
                 else:
                     await self.joined_members(room_id)
@@ -2366,15 +2367,30 @@ class AsyncClient(Client):
                     if durable is not None:
                         if retried:
                             durable._outbound._assert_joined(room_id)
-                        if recipients is not None:
-                            durable._outbound._assert_recipients_current(
-                                room, members_synced, recipients
+                        if recipients is not None and (
+                            self.rooms.get(room_id) is not room
+                            or room.members_synced != members_synced
+                            or (members_synced and recipients != list(room.users))
+                            or (
+                                not members_synced
+                                and durable._outbound.member_cache.get(room_id)
+                                is not recipients
+                            )
+                        ):
+                            raise RoomRecipientsChangedError(
+                                "room membership changed during encryption preparation"
                             )
                     # Another caller may cancel before its share completes.
                     if not self.olm.should_share_group_session(room_id):
                         return room
                     if (event := self.sharing_session.get(room_id)) is not None:
                         await event.wait()
+                    elif retried and durable is not None:
+                        await durable._outbound.share_group_session(
+                            room_id,
+                            ignore_unverified_devices=ignore_unverified_devices,
+                            require_joined=True,
+                        )
                     else:
                         await self.share_group_session(
                             room_id,

@@ -33,7 +33,6 @@ from .crypto import CryptoRequest
 
 if TYPE_CHECKING:
     from ..crypto.to_device import EncryptedToDevice
-    from ..rooms import MatrixRoom
     from .client import DurableSync
 
 
@@ -194,9 +193,9 @@ class OutboundCrypto:
 
     async def _keys_query(self, user_set: set[str] | None = None) -> KeysQueryResponse:
         response = await self._finish_pending()
+        if user_set is None and isinstance(response, KeysQueryResponse):
+            return response
         if not (self.crypto.olm.users_for_key_query if user_set is None else user_set):
-            if user_set is None and isinstance(response, KeysQueryResponse):
-                return response
             raise LocalProtocolError("No key query required.")
         with self.transaction():
             request = self.crypto.enqueue_query(user_set)
@@ -258,31 +257,12 @@ class OutboundCrypto:
         if self.session._metadata.get(room_id, {}).get("membership") != "join":
             raise LocalProtocolError(f"No longer joined to room {room_id}")
 
-    def _assert_recipients_current(
-        self, room: MatrixRoom, members_synced: bool, users: list[str]
+    async def ensure_members(
+        self, room_id: str, *, require_joined: bool = False
     ) -> None:
-        room_id = room.room_id
-        cached = self.member_cache.get(room_id)
-        if (
-            self.client.rooms.get(room_id) is not room
-            or not room.encrypted
-            or room.members_synced != members_synced
-            or (members_synced and users != list(room.users))
-            or (not members_synced and cached is not users)
-        ):
-            raise RoomRecipientsChangedError(
-                "room membership changed during encryption preparation"
-            )
-        if members_synced and cached is not None:
-            joined = room.users.keys() - room.invited_users.keys()
-            if set(cached) != joined:
-                raise LocalProtocolError(
-                    "joined member lookup disagrees with room state"
-                )
-
-    async def ensure_members(self, room_id: str) -> None:
         async with self.session._crypto_lock:
-            self._assert_joined(room_id)
+            if require_joined:
+                self._assert_joined(room_id)
             if room_id not in self.member_cache:
                 await self._joined_members(room_id)
 
@@ -301,7 +281,11 @@ class OutboundCrypto:
         )
 
     async def share_group_session(
-        self, room_id: str, ignore_unverified_devices: bool = False
+        self,
+        room_id: str,
+        ignore_unverified_devices: bool = False,
+        *,
+        require_joined: bool = False,
     ) -> ShareGroupSessionResponse:
         room = self.client.rooms.get(room_id)
         if room is None or not room.encrypted:
@@ -310,27 +294,32 @@ class OutboundCrypto:
             raise LocalProtocolError("a group share is already in flight for this room")
         self.client.sharing_session[room_id] = asyncio.Event()
         try:
-            members_synced = room.members_synced
-            if not members_synced:
-                await self.ensure_members(room_id)
-            users = list(room.users) if members_synced else self.member_cache[room_id]
+            if not room.members_synced:
+                await self.ensure_members(room_id, require_joined=require_joined)
+            users = (
+                list(room.users) if room.members_synced else self.member_cache[room_id]
+            )
             assert users is not None
+            if missing := self.crypto.olm.get_missing_sessions(users):
+                await self.keys_claim(missing)
             async with self.session._crypto_lock:
-                self._assert_joined(room_id)
-                replayed = await self._finish_pending()
-                self._assert_joined(room_id)
-                self._assert_recipients_current(room, members_synced, users)
-                olm = self.crypto.olm
-                if isinstance(replayed, KeysQueryResponse) and (
-                    dirty := olm.users_for_key_query.intersection(users)
+                if require_joined:
+                    self._assert_joined(room_id)
+                await self._finish_pending()
+                if require_joined:
+                    self._assert_joined(room_id)
+                if (
+                    self.client.rooms.get(room_id) is not room
+                    or (
+                        not room.members_synced
+                        and self.member_cache.get(room_id) is not users
+                    )
+                    or (room.members_synced and users != list(room.users))
                 ):
-                    await self._keys_query(dirty)
-                    self._assert_joined(room_id)
-                    self._assert_recipients_current(room, members_synced, users)
-                if missing := olm.get_missing_sessions(users):
-                    await self._keys_claim(missing)
-                    self._assert_joined(room_id)
-                    self._assert_recipients_current(room, members_synced, users)
+                    raise RoomRecipientsChangedError(
+                        "room membership changed before sharing"
+                    )
+                olm = self.crypto.olm
                 shared_with: set[tuple[str, str]] = set()
                 chunks = olm.share_group_session_parallel(
                     room_id, users, ignore_unverified_devices
