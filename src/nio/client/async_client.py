@@ -2348,52 +2348,32 @@ class AsyncClient(Client):
                 return room
 
             try:
-                members_synced = room.members_synced
-                recipients = None
-                if members_synced:
+                if not room.members_synced:
                     if durable is not None:
-                        recipients = list(room.users)
-                elif durable is not None:
-                    await durable._outbound.ensure_members(room_id)
-                    recipients = durable._outbound.member_cache[room_id]
-                else:
-                    await self.joined_members(room_id)
-                if not members_synced and self.should_query_keys:
-                    try:
-                        await self.keys_query()
-                    except _NoKeyQueryRequired:
-                        if durable is None:
-                            raise
-                        # Maintenance already finished discovery under the lock.
-
-                while True:
-                    # If sync invalidated the recipients while we awaited keys
-                    # or another caller's share, query keys for the new list.
-                    if durable is not None:
-                        cached = durable._outbound.member_cache.get(room_id)
-                        if recipients is not None and (
-                            self.rooms.get(room_id) is not room
-                            or room.members_synced != members_synced
-                            or (members_synced and recipients != list(room.users))
-                            or (
-                                not members_synced
-                                and cached is not recipients
-                                and (cached is None or set(cached) != set(recipients))
-                            )
-                        ):
-                            raise RoomRecipientsChangedError(
-                                "room membership changed during encryption preparation"
-                            )
-                    # Another caller may cancel before its share completes.
-                    if not self.olm.should_share_group_session(room_id):
-                        return room
-                    if (event := self.sharing_session.get(room_id)) is not None:
-                        await event.wait()
+                        await durable._outbound.ensure_members(room_id)
                     else:
+                        await self.joined_members(room_id)
+                    if self.should_query_keys:
+                        try:
+                            await self.keys_query()
+                        except _NoKeyQueryRequired:
+                            if durable is None:
+                                raise
+                            # Maintenance already finished discovery under the lock.
+
+                # A share another caller started may end without sharing, for
+                # example when that caller is cancelled, so check again after it.
+                while self.olm.should_share_group_session(room_id):
+                    try:
+                        event = self.sharing_session[room_id]
+                        await event.wait()
+                    except KeyError:
                         await self.share_group_session(
                             room_id,
                             ignore_unverified_devices=ignore_unverified_devices,
                         )
+
+                return room
             except RoomRecipientsChangedError:
                 # A single retry handles an intervening sync without spinning
                 # if the room's recipients keep changing.

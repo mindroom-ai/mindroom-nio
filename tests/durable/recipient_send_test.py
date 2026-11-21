@@ -146,8 +146,9 @@ async def test_room_send_uses_fresh_recipients_without_replacing_room_members(
         "query-fails-at-retry",
         "equal-lookups-with-already-shared-session",
         "leave-at-claim",
-        "join-at-query",
         "leave-at-wait-with-complete-members",
+        "two-joins-while-waiting",
+        "two-joins-while-waiting-with-complete-members",
         "duplicate-at-share",
         "retry-applies-share-policy",
         "repeated",
@@ -174,7 +175,9 @@ async def test_room_send_retries_sliding_recipient_invalidation(
     sent = []
     tasks = []
     same_lookup = race == "equal-lookups-with-already-shared-session"
-    complete = race == "leave-at-wait-with-complete-members"
+    complete = race.endswith("-with-complete-members")
+    leave_at_wait = race == "leave-at-wait-with-complete-members"
+    two_joins = race.startswith("two-joins-while-waiting")
 
     async def start_task(coro):
         started = asyncio.Event()
@@ -195,8 +198,8 @@ async def test_room_send_retries_sliding_recipient_invalidation(
     async def query(request):
         requested = (await request.json())["device_keys"]
         queries.append(set(requested))
-        if race == "query-fails-at-retry" or (complete and len(queries) > 1):
-            if complete:
+        if race == "query-fails-at-retry" or (leave_at_wait and len(queries) > 1):
+            if leave_at_wait:
                 assert set(requested) == {other}
             return web.json_response(
                 {"errcode": "M_FORBIDDEN", "error": "Denied"}, status=403
@@ -204,10 +207,6 @@ async def test_room_send_retries_sliding_recipient_invalidation(
         if same_lookup and len(queries) == 2:
             # A new device-list notification makes a spurious retry observable.
             nio_client.olm.users_for_key_query.add(recipient)
-        if race == "join-at-query" and other not in members:
-            assert other not in requested
-            members.add(other)
-            await sync(other_join, "join")
         return web.json_response(
             {
                 "device_keys": {
@@ -295,7 +294,29 @@ async def test_room_send_retries_sliding_recipient_invalidation(
         try:
             await session._accept_response(window(state=state))
             await settle(session)
-            if complete:
+            if two_joins:
+                await nio_client.keys_query()
+                nio_client.rooms[ROOM].members_synced = complete
+                if not complete:
+                    await nio_client.joined_members(ROOM)
+                third = "@third:example.org"
+                first, second = asyncio.Event(), asyncio.Event()
+                nio_client.sharing_session[ROOM] = first
+
+                async def first_share_ends():
+                    members.add(other)
+                    await sync(other_join, "first-join")
+                    nio_client.sharing_session[ROOM] = second
+                    first.set()
+
+                async def second_share_ends():
+                    members.add(third)
+                    await sync(member("$third-join", "join", third), "second-join")
+                    nio_client.sharing_session.pop(ROOM).set()
+
+                monkeypatch.setattr(first, "wait", first_share_ends)
+                monkeypatch.setattr(second, "wait", second_share_ends)
+            if leave_at_wait:
                 # Track the unrelated user's devices without adding them to this room.
                 await nio_client.keys_query({USER, recipient, other})
                 nio_client.rooms[ROOM].members_synced = True
@@ -365,11 +386,12 @@ async def test_room_send_retries_sliding_recipient_invalidation(
                 result = await send_notice()
                 assert isinstance(result, RoomSendResponse)
                 assert result.event_id == "$sent"
-                if complete:
+                if leave_at_wait:
                     assert not shares
                     assert queries == [{USER, recipient, other}]
-                elif race == "join-at-query":
-                    assert shares == [{recipient, other}]
+                elif two_joins:
+                    assert first.is_set() and second.is_set()
+                    assert shares == [{recipient}]
                 elif race == "duplicate-at-share":
                     assert shares == [{recipient}, {recipient}]
                 else:
