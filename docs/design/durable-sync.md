@@ -349,7 +349,10 @@ request of the durable `Transport` (`/sync`, crypto requests, `/messages`, joine
 members, joins and leaves), `next_batch()`, `dispatch()`, `wait_for_room_ready()`,
 the position check of `change_membership()` and `export_keys()` wait for it
 first. It returns only when nothing is left to sync, and a failed fsync closes
-the store, since the kernel may report a lost write only once. Every other commit, including acknowledgements, device trust,
+the store and poisons the session, since the kernel may report a lost write
+only once. A store reopened after a crash syncs its WAL once before its first
+effect, and `close()` syncs it too, since a reader can keep the final
+checkpoint from doing so. Every other commit, including acknowledgements, device trust,
 key-share decisions and the results of joins, leaves and crypto requests, stays
 FULL and is durable when its call returns. Until such an fsync, other tasks can
 read in-memory room and crypto state that a power loss would roll back; the

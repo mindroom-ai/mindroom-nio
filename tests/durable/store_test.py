@@ -4,6 +4,7 @@ import asyncio
 import errno
 import os
 import shutil
+import sqlite3
 import threading
 from uuid import UUID
 
@@ -296,25 +297,29 @@ def synchronous(store):
 async def test_sync_later_commits_share_one_off_loop_wal_fsync(tmp_path, monkeypatch):
     store = open_store(tmp_path)
     try:
+        with store.transaction():
+            assert synchronous(store) == 2
         with store.transaction(sync_later=True):
             assert synchronous(store) == 1
             store.publish((message(),))
         with store.transaction(sync_later=True):
             store.publish(())
-        with store.transaction():
-            assert synchronous(store) == 2
-            store.publish(())
+        assert synchronous(store) == 2
         synced = []
         fsync = os.fsync
-        monkeypatch.setattr(
-            os, "fsync", lambda fd: synced.append(os.fstat(fd).st_ino) or fsync(fd)
-        )
+
+        def record(fd):
+            on_loop = threading.current_thread() is threading.main_thread()
+            synced.append((os.fstat(fd).st_ino, on_loop))
+            fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", record)
         await store.make_durable()
         await store.make_durable()
-        # One fsync covers both commits; the first also syncs the new WAL's
-        # directory entry.
+        # One fsync off the loop covers both commits; the first also syncs
+        # the WAL's directory entry.
         wal = os.stat(f"{store.path}-wal").st_ino
-        assert synced == [os.stat(tmp_path).st_ino, wal]
+        assert synced == [(os.stat(tmp_path).st_ino, False), (wal, False)]
     finally:
         store.close()
 
@@ -396,21 +401,27 @@ async def test_a_failed_wal_fsync_closes_the_store(tmp_path, monkeypatch, waiter
 
 
 @pytest.mark.asyncio
-async def test_closing_during_a_wal_fsync_reports_a_closed_store(tmp_path, monkeypatch):
+@pytest.mark.parametrize("held", ["directory", "wal"])
+async def test_closing_during_a_wal_fsync_reports_a_closed_store(
+    tmp_path, monkeypatch, held
+):
     store = open_store(tmp_path)
     try:
         with store.transaction(sync_later=True):
             store.publish(())
-        started, release = threading.Event(), threading.Event()
+        started, release, calls = threading.Event(), threading.Event(), []
         fsync = os.fsync
 
-        def held(fd):
-            # The first fsync is the directory's, before the WAL is opened.
-            started.set()
-            assert release.wait(5)
+        def hold(fd):
+            # The directory's fsync comes before the WAL is opened; holding
+            # the WAL's lets that fsync succeed on the unlinked file.
+            calls.append(fd)
+            if len(calls) == (1 if held == "directory" else 2):
+                started.set()
+                assert release.wait(5)
             fsync(fd)
 
-        monkeypatch.setattr(os, "fsync", held)
+        monkeypatch.setattr(os, "fsync", hold)
         sync = asyncio.create_task(store.make_durable())
         assert await asyncio.to_thread(started.wait, 5)
         store.close()
@@ -550,5 +561,64 @@ def test_acknowledgement_inside_a_transaction_commits_with_it(tmp_path):
         # Deferring here would leave the acknowledged row ahead of the new one.
         assert durable_ack(store) == (batch.sequence, 1)
         assert store.next_batch() == later
+    finally:
+        store.close()
+
+
+def test_close_syncs_what_a_reader_kept_from_its_checkpoint(tmp_path, monkeypatch):
+    store = open_store(tmp_path)
+    reader = sqlite3.connect(store.path)
+    try:
+        with store.transaction(sync_later=True):
+            store.publish((message(),))
+        wal = os.stat(f"{store.path}-wal").st_ino
+        # An open read transaction keeps close() from checkpointing the WAL.
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM NioDurableBatch").fetchone()
+        synced = []
+        fsync = os.fsync
+        monkeypatch.setattr(
+            os, "fsync", lambda fd: synced.append(os.fstat(fd).st_ino) or fsync(fd)
+        )
+        store.close()
+        assert wal in synced
+    finally:
+        reader.close()
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_directory_does_not_stop_the_wal_fsync(tmp_path):
+    store = open_store(tmp_path / "store")
+    try:
+        with store.transaction(sync_later=True):
+            store.publish(())
+        # Like SQLite, sync without the directory when it cannot be opened.
+        (tmp_path / "store").chmod(0o300)
+        await store.make_durable()
+        assert store._synced == store._commits
+    finally:
+        (tmp_path / "store").chmod(0o700)
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_reopened_store_syncs_before_its_first_effect(tmp_path, monkeypatch):
+    killed = open_store(tmp_path / "killed")
+    with killed.transaction(sync_later=True):
+        killed.publish((message(),))
+    # A process killed here leaves its WAL and the commits in it.
+    shutil.copytree(tmp_path / "killed", tmp_path / "store")
+    killed.close()
+    store = open_store(tmp_path / "store")
+    try:
+        synced = []
+        fsync = os.fsync
+        monkeypatch.setattr(
+            os, "fsync", lambda fd: synced.append(os.fstat(fd).st_ino) or fsync(fd)
+        )
+        # A crashed process may have left commits in the WAL unsynced.
+        await store.make_durable()
+        assert os.stat(f"{store.path}-wal").st_ino in synced
     finally:
         store.close()

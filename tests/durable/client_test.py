@@ -1,6 +1,7 @@
 """The durable adapter owns transactions, not application callbacks."""
 
 import asyncio
+import errno
 import json
 import os
 import threading
@@ -600,8 +601,9 @@ async def test_room_readiness_does_not_answer_for_a_session_closed_meanwhile(
         fsync = os.fsync
 
         def held(fd):
-            started.set()
-            assert release.wait(5)
+            if not started.is_set():
+                started.set()
+                assert release.wait(5)
             fsync(fd)
 
         monkeypatch.setattr(os, "fsync", held)
@@ -631,10 +633,30 @@ async def test_answers_from_room_state_wait_for_its_sync(tmp_path, monkeypatch):
     session = open_session(tmp_path, nio_client)
     try:
         await session._accept_response(response())
+        record = None
+        while record is None and (batch := await session.next_batch()):
+            record = next(
+                (r for r in batch.records if r.kind is RecordKind.TIMELINE), None
+            )
+            await session.ack(batch)
+        assert record is not None
+        durable_when_called = []
+
+        def observe(*_):
+            durable_when_called.append(
+                session._store._synced == session._store._commits
+            )
+
+        nio_client.add_event_callback(observe, RoomMessageText)
+        load = nio_client.store.load_inbound_group_sessions
+
+        def load_after_sync():
+            observe()
+            return load()
+
+        nio_client.store.load_inbound_group_sessions = load_after_sync
         answers = {
-            "dispatch": lambda: session.dispatch(
-                SyncRecord(RecordKind.TIMELINE, ROOM, {}, route=None)
-            ),
+            "dispatch": lambda: session.dispatch(record),
             "membership": lambda: session.change_membership(
                 operation_id=UUID(int=1),
                 room_id=ROOM,
@@ -653,6 +675,8 @@ async def test_answers_from_room_state_wait_for_its_sync(tmp_path, monkeypatch):
             await answer()
             assert os.stat(f"{session._store.path}-wal").st_ino in synced, name
             monkeypatch.undo()
+        # The callback and the key snapshot came after their sync.
+        assert durable_when_called == [True, True]
     finally:
         await session.close()
         await nio_client.close()
@@ -680,6 +704,50 @@ async def test_transient_callbacks_follow_the_sync_of_their_capture(tmp_path):
         }
         await session._accept_response(json.dumps(body).encode())
         assert durable == [True]
+    finally:
+        await session.close()
+        await nio_client.close()
+
+
+@pytest.mark.asyncio
+async def test_room_readiness_answers_false_from_durable_membership(
+    tmp_path, monkeypatch
+):
+    session = open_session(tmp_path)
+    try:
+        await session._accept_response(response())
+        # As preparation does after a kick, record the departure unsynced.
+        with session._store.transaction(sync_later=True):
+            session._metadata[ROOM]["membership"] = "leave"
+            session._store.publish(())
+        synced = recorded_fsyncs(monkeypatch)
+        assert await session.wait_for_room_ready(ROOM) is False
+        assert os.stat(f"{session._store.path}-wal").st_ino in synced
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_wal_fsync_poisons_the_session(tmp_path, monkeypatch):
+    nio_client = client()
+    session = open_session(tmp_path, nio_client)
+    try:
+        await session._accept_response(response())
+        with session._store.transaction(sync_later=True):
+            session._store.publish(())
+
+        def fail(fd):
+            raise OSError(errno.EIO, "lost write")
+
+        monkeypatch.setattr(os, "fsync", fail)
+        session._changed.clear()
+        with pytest.raises(OSError, match="lost write"):
+            await session.next_batch()
+        monkeypatch.undo()
+        # Waiters wake, and neither the session nor the client works on.
+        assert session._changed.is_set()
+        with pytest.raises(LocalProtocolError):
+            nio_client._assert_not_disposed()
     finally:
         await session.close()
         await nio_client.close()

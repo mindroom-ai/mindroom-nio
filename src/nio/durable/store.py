@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from copy import deepcopy
 from dataclasses import dataclass
@@ -113,6 +113,8 @@ class DurableStore:
         # Commits that skipped their fsync, and how many of them one covers.
         self._commits = self._synced = 0
         self._flush: asyncio.Future[None] | None = None
+        # Called after a failed fsync closed the store.
+        self.on_failure: Callable[[], None] | None = None
         self._wal_path: str | None = None
         self._wal_entry_synced = False
         self._lease = FileLease(self.path)
@@ -169,6 +171,9 @@ class DurableStore:
             if mode[0] == "wal":
                 # SQLite names the WAL after the file a symlink resolves to.
                 self._wal_path = os.path.realpath(self.path) + "-wal"
+                # A process that crashed may have left commits in its WAL
+                # unsynced: sync it once before the first effect.
+                self._commits = int(os.path.exists(self._wal_path))
             self.database.execute_sql("PRAGMA synchronous=FULL")
         except BaseException:
             self.close()
@@ -311,8 +316,10 @@ class DurableStore:
         reads the store right after it, without awaiting, sees durable state.
         A failed fsync closes the store.
         """
-        while self._synced < self._commits:
+        while True:
             self._assert_open()
+            if self._synced >= self._commits:
+                return
             if self._flush is None:
                 self._flush = asyncio.ensure_future(self._sync(self._commits))
             # A cancelled caller stops waiting, never the fsync or its outcome.
@@ -327,6 +334,8 @@ class DurableStore:
             # The kernel may report a lost write only once, so no later fsync
             # may certify these commits.
             self.close()
+            if self.on_failure is not None:
+                self.on_failure()
             raise
         else:
             self._synced = max(self._synced, commits)
@@ -336,9 +345,11 @@ class DurableStore:
     def _fsync(self) -> None:
         assert self._wal_path is not None
         if not self._wal_entry_synced:
-            # SQLite syncs a new WAL's directory entry when it first syncs the
-            # WAL, which a sync_later commit leaves to later.
-            self._fsync_path(os.path.dirname(self._wal_path))
+            # SQLite syncs the directory entry of a WAL it creates, but not of
+            # one a crashed process left. Like SQLite, carry on when the
+            # directory cannot be opened.
+            with suppress(OSError):
+                self._fsync_path(os.path.dirname(self._wal_path))
             self._wal_entry_synced = True
         self._fsync_path(self._wal_path)
 
@@ -604,6 +615,10 @@ class DurableStore:
             # Best effort: losing this write only redelivers an empty batch.
             with suppress(Exception), self.transaction():
                 pass
+        if self._wal_path is not None and self._synced < self._commits:
+            # A reader can keep the final checkpoint from syncing the WAL.
+            with suppress(OSError):
+                self._fsync()
         if not self.database.is_closed():
             self.database.close()
         self.database.revoked = True

@@ -194,10 +194,10 @@ def main() -> None:
             )
         try:
             result = asyncio.run(run(args, directory))
+            if writer is not None and writer.poll() is not None:
+                raise RuntimeError("the disk pressure writer exited early")
         finally:
             if writer is not None:
-                if writer.poll() is not None:
-                    raise RuntimeError("the disk pressure writer exited early")
                 writer.kill()
                 writer.wait()
     print(

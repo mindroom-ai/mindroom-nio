@@ -122,6 +122,8 @@ class DurableSync:
         )
         self._sliding = SlidingSource(self, config.sliding) if config.sliding else None
         self._recovery = Recovery(self)
+        # A failed fsync disposes the client and wakes every waiter.
+        store.on_failure = self._recovery._poison
 
     def _restore_rooms(self) -> None:
         for room_id, encoded in self._store.load_room_metadata().items():
@@ -639,13 +641,15 @@ class DurableSync:
         ``dispatch()``, does not return until the session closes unless the
         room can already accept sends.
 
-        Return True once the client can send to the room, at once if it
-        already can. Return False as soon as the client's own membership in
-        the room, as this session has recorded it from sync or
-        ``change_membership()``, is not join, including at the call: a room
-        sync has not reported yet, such as one just made with
+        Both answers come from state that survives power loss, so either may
+        first wait for one fsync of the store. Return True once the client can
+        send to the room, at once if it already can. Return False as soon as
+        the client's own membership in the room, as this session has recorded
+        it from sync or ``change_membership()``, is not join, including at the
+        call: a room sync has not reported yet, such as one just made with
         ``room_create()``, returns False at once.
-        Raise ``LocalProtocolError`` if the session closes while waiting.
+        Raise ``LocalProtocolError`` if the session closes while waiting, and
+        ``OSError`` if that fsync fails, which also closes the session.
         """
         while True:
             # Answer only from durable state.
