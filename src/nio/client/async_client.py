@@ -2358,7 +2358,7 @@ class AsyncClient(Client):
                     recipients = durable._outbound.member_cache[room_id]
                 else:
                     await self.joined_members(room_id)
-                if (retried or not members_synced) and self.should_query_keys:
+                if not members_synced and self.should_query_keys:
                     try:
                         await self.keys_query()
                     except _NoKeyQueryRequired:
@@ -2377,6 +2377,7 @@ class AsyncClient(Client):
                             or (members_synced and recipients != list(room.users))
                             or (
                                 not members_synced
+                                and cached is not recipients
                                 and (cached is None or set(cached) != set(recipients))
                             )
                         ):

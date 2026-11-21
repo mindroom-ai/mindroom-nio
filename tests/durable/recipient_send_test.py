@@ -143,13 +143,11 @@ async def test_room_send_uses_fresh_recipients_without_replacing_room_members(
     [
         "duplicate-at-lookup",
         "maintenance-at-retry-lookup",
-        "maintenance-at-retry-with-complete-members",
         "query-fails-at-retry",
         "equal-lookups-with-already-shared-session",
         "leave-at-claim",
         "join-at-query",
-        "join-at-claim-with-complete-members",
-        "join-at-wait-with-complete-members",
+        "leave-at-wait-with-complete-members",
         "duplicate-at-share",
         "retry-applies-share-policy",
         "repeated",
@@ -176,6 +174,7 @@ async def test_room_send_retries_sliding_recipient_invalidation(
     sent = []
     tasks = []
     same_lookup = race == "equal-lookups-with-already-shared-session"
+    complete = race == "leave-at-wait-with-complete-members"
 
     async def start_task(coro):
         started = asyncio.Event()
@@ -196,7 +195,9 @@ async def test_room_send_retries_sliding_recipient_invalidation(
     async def query(request):
         requested = (await request.json())["device_keys"]
         queries.append(set(requested))
-        if race == "query-fails-at-retry":
+        if race == "query-fails-at-retry" or (complete and len(queries) > 1):
+            if complete:
+                assert set(requested) == {other}
             return web.json_response(
                 {"errcode": "M_FORBIDDEN", "error": "Denied"}, status=403
             )
@@ -244,9 +245,6 @@ async def test_room_send_retries_sliding_recipient_invalidation(
                 assert other in requested
                 members.remove(other)
                 await sync(member("$leave", "leave", other), "leave")
-            if race == "join-at-claim-with-complete-members" and other not in members:
-                members.add(other)
-                await sync(other_join, "join")
             return web.json_response(
                 {
                     "one_time_keys": {
@@ -297,30 +295,32 @@ async def test_room_send_retries_sliding_recipient_invalidation(
         try:
             await session._accept_response(window(state=state))
             await settle(session)
-            complete = race.endswith("with-complete-members")
             if complete:
-                await nio_client.keys_query()
+                # Track the unrelated user's devices without adding them to this room.
+                await nio_client.keys_query({USER, recipient, other})
                 nio_client.rooms[ROOM].members_synced = True
-            if race in (
-                "join-at-wait-with-complete-members",
-                "maintenance-at-retry-with-complete-members",
-            ):
                 sharing = asyncio.Event()
                 nio_client.sharing_session[ROOM] = sharing
 
-                async def finish_share_after_join():
-                    members.add(other)
-                    await sync(other_join, "join")
-                    if race == "maintenance-at-retry-with-complete-members":
-                        lock = session._crypto_lock
-                        await lock.acquire()
-                        try:
-                            await start_task(session._maintain_crypto())
-                        finally:
-                            asyncio.get_running_loop().call_soon(lock.release)
+                async def finish_share_after_leave():
+                    members.remove(recipient)
+                    update = json.loads(
+                        window(
+                            pos="leave",
+                            initial=False,
+                            state=[member("$leave", "leave", recipient)],
+                        )
+                    )
+                    update["extensions"]["e2ee"] = {
+                        "device_lists": {"changed": [other], "left": []}
+                    }
+                    await session._accept_response(json.dumps(update).encode())
+                    await settle(session)
+                    assert set(nio_client.rooms[ROOM].users) == {USER}
+                    assert nio_client.olm.users_for_key_query == {other}
                     nio_client.sharing_session.pop(ROOM).set()
 
-                monkeypatch.setattr(sharing, "wait", finish_share_after_join)
+                monkeypatch.setattr(sharing, "wait", finish_share_after_leave)
 
             async def send_notice(tx_id="notice"):
                 return await nio_client.room_send(
@@ -365,7 +365,10 @@ async def test_room_send_retries_sliding_recipient_invalidation(
                 result = await send_notice()
                 assert isinstance(result, RoomSendResponse)
                 assert result.event_id == "$sent"
-                if race == "join-at-query" or complete:
+                if complete:
+                    assert not shares
+                    assert queries == [{USER, recipient, other}]
+                elif race == "join-at-query":
                     assert shares == [{recipient, other}]
                 elif race == "duplicate-at-share":
                     assert shares == [{recipient}, {recipient}]
@@ -376,13 +379,9 @@ async def test_room_send_retries_sliding_recipient_invalidation(
                 assert payload["algorithm"] == "m.megolm.v1.aes-sha2"
                 assert payload["ciphertext"]
                 assert "body" not in payload
-                if race.startswith("maintenance-at-"):
+                if race == "maintenance-at-retry-lookup":
                     await tasks[0]
-                    assert queries == (
-                        [{USER, recipient}, {other}]
-                        if complete
-                        else [{USER, recipient}]
-                    )
+                    assert queries == [{USER, recipient}]
                     with pytest.raises(
                         LocalProtocolError, match="No key query required"
                     ):
