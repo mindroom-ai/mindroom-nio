@@ -215,7 +215,7 @@ class Recovery:
         if state.get("phase") == "recover":
             return
         try:
-            with session._store.transaction():
+            async with session._store.transaction_async():
                 if new_input is not None:
                     session._store.capture(new_input[0])
                 if "phase" not in state:
@@ -245,7 +245,6 @@ class Recovery:
                         processor.save()
                         session._crypto.capture()
                         session._store.save_continuation(state)
-                        session._changed.set()
                         return
                     if session.cursor or session._sliding:
                         for room_id in state["unknown_rooms"]:
@@ -260,10 +259,16 @@ class Recovery:
                     and session._crypto.next_request() is None
                 ):
                     session._complete_input()
+        except asyncio.CancelledError:
+            # Only the shielded commit can be cancelled here, and it still
+            # lands, so the session stays usable for another run().
+            raise
         except BaseException:
             self._poison()
             raise
-        session._changed.set()
+        finally:
+            # Wake waiters after the commit, never before it.
+            session._changed.set()
 
     def _next_room(self, state: dict[str, Any], index: int) -> None:
         candidates = self._candidates()
@@ -483,12 +488,12 @@ class Recovery:
         page = None
         if room_id in state["unknown_rooms"]:
             # Already reported at capture; current state cannot fill this interval.
-            self._commit_page(state, room_id, section, [], None, done=True)
+            await self._commit_page(state, room_id, section, [], None, done=True)
             return
         if not isinstance(target, str) or not target or len(target) > 8192:
             error = "missing or oversized history boundary"
         elif state["from"] == target:
-            self._commit_page(state, room_id, section, [], None, done=True)
+            await self._commit_page(state, room_id, section, [], None, done=True)
             return
         elif state["pages"] >= min(session.config.max_recovery_pages, 1000):
             error = "history page limit exhausted"
@@ -544,7 +549,9 @@ class Recovery:
             except (LocalProtocolError, ValueError, TypeError, KeyError):
                 error = "history unavailable or malformed"
         if error is not None:
-            self._commit_page(state, room_id, section, [], None, done=True, loss=error)
+            await self._commit_page(
+                state, room_id, section, [], None, done=True, loss=error
+            )
             return
         assert isinstance(page, RoomMessagesResponse)
         tail_ids = {event.source.get("event_id") for event in info.timeline.events}
@@ -583,7 +590,7 @@ class Recovery:
             state["applied_ids"][room_id] = previous_ids
             error = "history continuation bound exhausted"
             events = []
-        self._commit_page(
+        await self._commit_page(
             state,
             room_id,
             section,
@@ -593,7 +600,7 @@ class Recovery:
             loss=error,
         )
 
-    def _commit_page(
+    async def _commit_page(
         self,
         state: dict[str, Any],
         room_id: str,
@@ -606,7 +613,7 @@ class Recovery:
     ) -> None:
         session = self.session
         try:
-            with session._store.transaction():
+            async with session._store.transaction_async():
                 processor = Processor(
                     session,
                     state["history_rooms"],
@@ -665,6 +672,8 @@ class Recovery:
                 else:
                     state["from"] = end
                 session._store.save_continuation(state)
+        except asyncio.CancelledError:
+            raise
         except BaseException:
             self._poison()
             raise
