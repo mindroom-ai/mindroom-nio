@@ -96,6 +96,7 @@ from ..exceptions import (
     InsufficientRecursionDepthError,
     LocalProtocolError,
     RemoteProtocolError,
+    RoomRecipientsChangedError,
     TransferCancelledError,
 )
 from ..monitors import TransferMonitor
@@ -2274,8 +2275,10 @@ class AsyncClient(Client):
         This method also makes sure that the room members are fully synced and
         that keys are queried before sending messages to an encrypted room.
 
-        If encrypted state cannot be fully synced after a couple of retries,
-        this raises `SendRetryError`.
+        With durable sync, encryption preparation retries once if the room's
+        recipients are invalidated mid-preparation. If invalidated again,
+        it raises `RoomRecipientsChangedError`. The retry does not resend the
+        room event.
 
         Raises `LocalProtocolError` if the client isn't logged in.
         """
@@ -2321,39 +2324,56 @@ class AsyncClient(Client):
         the group session when it is missing, unshared or expired.
         """
         assert self.olm
-        try:
-            room = self.rooms[room_id]
-        except KeyError:
-            raise LocalProtocolError(f"No such room with id {room_id} found.")
+        retried = False
+        while True:
+            room = self.rooms.get(room_id)
+            if room is None:
+                raise LocalProtocolError(f"No such room with id {room_id} found.")
 
-        durable = self._durable_session
-        if durable is not None and not durable._room_ready(room_id):
-            raise LocalProtocolError(
-                "room state must be established before plaintext sending"
-            )
+            durable = self._durable_session
+            if retried:
+                if durable is None:
+                    raise LocalProtocolError("durable sync detached during preparation")
+                # Recovery can record our leave before it removes the room.
+                if durable._metadata.get(room_id, {}).get("membership") != "join":
+                    raise LocalProtocolError(f"No longer joined to room {room_id}")
+            if durable is not None and not durable._room_ready(room_id):
+                raise LocalProtocolError(
+                    "room state must be established before plaintext sending"
+                )
+            if not room.encrypted:
+                if retried:
+                    raise LocalProtocolError(f"Room {room_id} is no longer encrypted")
+                return room
 
-        if room.encrypted:
-            if not room.members_synced:
-                if durable is not None:
-                    await durable._outbound.ensure_members(room_id)
-                else:
-                    await self.joined_members(room_id)
-                if self.should_query_keys:
-                    await self.keys_query()
+            try:
+                if not room.members_synced:
+                    if durable is not None:
+                        await durable._outbound.ensure_members(room_id)
+                    else:
+                        await self.joined_members(room_id)
+                    if self.should_query_keys:
+                        await self.keys_query()
 
-            # A share another caller started may end without sharing, for
-            # example when that caller is cancelled, so check again after it.
-            while self.olm.should_share_group_session(room_id):
-                try:
-                    event = self.sharing_session[room_id]
-                    await event.wait()
-                except KeyError:
-                    await self.share_group_session(
-                        room_id,
-                        ignore_unverified_devices=ignore_unverified_devices,
-                    )
+                # A share another caller started may end without sharing, for
+                # example when that caller is cancelled, so check again after it.
+                while self.olm.should_share_group_session(room_id):
+                    try:
+                        event = self.sharing_session[room_id]
+                        await event.wait()
+                    except KeyError:
+                        await self.share_group_session(
+                            room_id,
+                            ignore_unverified_devices=ignore_unverified_devices,
+                        )
 
-        return room
+                return room
+            except RoomRecipientsChangedError:
+                # A single retry handles an intervening sync without spinning
+                # if the room's recipients keep changing.
+                if retried:
+                    raise
+                retried = True
 
     @logged_in_async
     @store_loaded

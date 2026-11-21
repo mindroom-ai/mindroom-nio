@@ -21,6 +21,10 @@ class LocalProtocolError(ProtocolError):
     pass
 
 
+class RoomRecipientsChangedError(LocalProtocolError):
+    """A durable room's recipients or outbound session changed during preparation."""
+
+
 class MembersSyncError(LocalProtocolError):
     pass
 
