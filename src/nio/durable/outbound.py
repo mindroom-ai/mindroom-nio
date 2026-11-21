@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING
 
 from ..api import Api
@@ -43,6 +44,9 @@ class OutboundCrypto:
         self.store = session._store
         self.crypto = session._crypto
         self.member_cache: dict[str, list[str] | None] = {}
+        self._share_retry_room: ContextVar[str | None] = ContextVar(
+            "durable_share_retry_room", default=None
+        )
         self.maintenance_due = bool(
             self.crypto.olm.wedged_devices
             or self.crypto.olm.key_request_devices_no_session
@@ -280,13 +284,19 @@ class OutboundCrypto:
             message.request_id, message.session_id, message.room_id, message.algorithm
         )
 
+    @contextmanager
+    def _share_retry(self, room_id: str) -> Iterator[None]:
+        """Preserve retry-only joined checks across the public sharing method."""
+        token = self._share_retry_room.set(room_id)
+        try:
+            yield
+        finally:
+            self._share_retry_room.reset(token)
+
     async def share_group_session(
-        self,
-        room_id: str,
-        ignore_unverified_devices: bool = False,
-        *,
-        require_joined: bool = False,
+        self, room_id: str, ignore_unverified_devices: bool = False
     ) -> ShareGroupSessionResponse:
+        require_joined = self._share_retry_room.get() == room_id
         room = self.client.rooms.get(room_id)
         if room is None or not room.encrypted:
             raise LocalProtocolError("group sharing requires a joined encrypted room")

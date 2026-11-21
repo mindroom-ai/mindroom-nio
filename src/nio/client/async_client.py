@@ -32,6 +32,7 @@ from collections.abc import (
     Iterator,
     Sequence,
 )
+from contextlib import nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial, wraps
@@ -2385,17 +2386,16 @@ class AsyncClient(Client):
                         return room
                     if (event := self.sharing_session.get(room_id)) is not None:
                         await event.wait()
-                    elif retried and durable is not None:
-                        await durable._outbound.share_group_session(
-                            room_id,
-                            ignore_unverified_devices=ignore_unverified_devices,
-                            require_joined=True,
-                        )
                     else:
-                        await self.share_group_session(
-                            room_id,
-                            ignore_unverified_devices=ignore_unverified_devices,
-                        )
+                        with (
+                            durable._outbound._share_retry(room_id)
+                            if retried and durable is not None
+                            else nullcontext()
+                        ):
+                            await self.share_group_session(
+                                room_id,
+                                ignore_unverified_devices=ignore_unverified_devices,
+                            )
             except RoomRecipientsChangedError:
                 # A single retry handles an intervening sync without spinning
                 # if the room's recipients keep changing.

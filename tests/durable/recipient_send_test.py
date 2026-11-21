@@ -8,6 +8,7 @@ import vodozemac
 from aiohttp import web
 from unpaddedbase64 import decode_base64
 
+from nio import AsyncClient
 from nio.crypto import Olm
 from nio.exceptions import (
     LocalProtocolError,
@@ -146,6 +147,7 @@ async def test_room_send_uses_fresh_recipients_without_replacing_room_members(
         "join-at-claim-with-complete-members",
         "join-at-wait-with-complete-members",
         "duplicate-at-share",
+        "retry-applies-share-policy",
         "repeated",
     ],
 )
@@ -218,7 +220,10 @@ async def test_room_send_retries_sliding_recipient_invalidation(
             )
         if "/sendToDevice/m.room.encrypted/" in request.path:
             shares.append(set((await request.json())["messages"]))
-            if race == "duplicate-at-share" and len(shares) == 1:
+            if (
+                race in ("duplicate-at-share", "retry-applies-share-policy")
+                and len(shares) == 1
+            ):
                 await sync(own_join, "during-share")
             return web.json_response({})
         if "/send/" in request.path:
@@ -226,9 +231,22 @@ async def test_room_send_retries_sliding_recipient_invalidation(
             return web.json_response({"event_id": "$sent"})
         raise AssertionError(request.path)
 
+    class PolicyClient(AsyncClient):
+        share_attempts = 0
+
+        async def share_group_session(self, room_id, ignore_unverified_devices=False):
+            self.share_attempts += 1
+            if self.share_attempts == 2:
+                raise LocalProtocolError("subclass denied key sharing")
+            return await super().share_group_session(room_id, ignore_unverified_devices)
+
     async with homeserver(None, query=query, membership=http) as (url, _):
-        nio_client = client()
-        nio_client.homeserver = url
+        if race == "retry-applies-share-policy":
+            nio_client = PolicyClient(url, USER, "ALICE")
+            nio_client.restore_login(USER, "ALICE", "test-token")
+        else:
+            nio_client = client()
+            nio_client.homeserver = url
         session = open_session(
             tmp_path,
             nio_client,
@@ -269,6 +287,11 @@ async def test_room_send_retries_sliding_recipient_invalidation(
                 with pytest.raises(RoomRecipientsChangedError):
                     await send_notice()
                 assert not shares and not sent
+            elif race == "retry-applies-share-policy":
+                with pytest.raises(LocalProtocolError, match="subclass denied"):
+                    await send_notice()
+                assert shares == [{recipient}]
+                assert not sent
             else:
                 result = await send_notice()
                 assert isinstance(result, RoomSendResponse)
