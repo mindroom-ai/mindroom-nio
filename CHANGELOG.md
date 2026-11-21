@@ -2,6 +2,10 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.4.3
+
+- Encrypted `room_send` and `room_encrypt` retry their encryption preparation once when durable sync invalidates the room's recipients mid-preparation, for example when a sync echo carries an unchanged member event. The durable outbound raise sites now raise `RoomRecipientsChangedError`, a `LocalProtocolError` subclass. The retry checks again that the room is joined and encrypted, rebuilds recipients from fresh state and goes through the public `share_group_session`; the room-event `/send` is never retried and nothing falls back to plaintext.
+
 ## 1.4.2
 
 - An idle durable sync cycle commits once instead of twice, and every other cycle once less: the acknowledgement of an empty batch that is the only one queued is written by the next transaction or by `close()`. An acknowledgement inside an open transaction is written there, and a failed transaction keeps the deferred acknowledgement, so `progress_generation` never moves backward. A process killed before that write is given the empty batch again after it restarts, before its first request, so a consumer must not take a completion whose receipt it already holds as proof that it has caught up.
