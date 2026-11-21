@@ -2,27 +2,22 @@
 
 A local homeserver answers every /sync at once, each response carrying
 ``--messages`` new events, and a consumer task drains and acknowledges every
-batch. A heartbeat task wakes every 5 ms and records how late it wakes. Every
-durable commit fsyncs the SQLite WAL (``synchronous=FULL``), so a commit that
-blocks the loop shows up as heartbeat lag of about one fsync.
+batch. A heartbeat task wakes every 5 ms and records how late it wakes. An
+fsync on the event loop, such as a durable commit with ``synchronous=FULL``,
+shows up as heartbeat lag of about one fsync.
 
-Make fsync slow in one of three ways:
+Make fsync slow in one of two ways:
 
-* ``--commit-delay-ms N`` sleeps N ms inside every durable commit, as a slow
-  fsync does (the sleep releases the GIL like the syscall). Deterministic and
-  portable; it simulates the disk.
+* On Linux, strace delays the real syscalls without root; this is the
+  deterministic one::
+
+      strace -f -qq -o /dev/null --seccomp-bpf -e trace=fsync,fdatasync \\
+          -e inject=fsync,fdatasync:delay_enter=100000 \\
+          uv run python scripts/bench_durable_commit_lag.py
+
 * ``--disk-pressure`` runs a second process that keeps writing and fsyncing a
   large file next to the database, so real fsyncs queue behind its writeback.
   How much this slows fsync depends on the disk and filesystem.
-* On Linux, strace can delay the real syscalls without root::
-
-      strace -f -qq -o /dev/null --seccomp-bpf -e trace=fsync,fdatasync \\
-          -e inject=fsync,fdatasync:delay_enter=200000 \\
-          uv run python scripts/bench_durable_commit_lag.py
-
-Run::
-
-    uv run python scripts/bench_durable_commit_lag.py --commit-delay-ms 200
 """
 
 from __future__ import annotations
@@ -41,7 +36,6 @@ from pathlib import Path
 from uuid import UUID
 
 from aiohttp import web
-from peewee import SqliteDatabase
 
 from nio import AsyncClient, AsyncClientConfig
 from nio.durable import DurableSyncConfig, open_durable_sync
@@ -160,7 +154,7 @@ async def run(args: argparse.Namespace, directory: Path) -> dict[str, float]:
     finally:
         elapsed = time.perf_counter() - started
         stop.set()
-        cycles = responses - first
+        cycles, timed_commits = responses - first, commits
         for task in tasks[:2]:
             task.cancel()
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -175,7 +169,7 @@ async def run(args: argparse.Namespace, directory: Path) -> dict[str, float]:
         "seconds": round(elapsed, 2),
         "sync_responses": cycles,
         "responses_per_second": round(cycles / elapsed, 2),
-        "commits": commits,
+        "commits": timed_commits,
         "lag_p50_ms": round(statistics.median(lags) * 1000, 2),
         "lag_p99_ms": round(statistics.quantiles(lags, n=100)[98] * 1000, 2),
         "lag_max_ms": round(max(lags) * 1000, 2),
@@ -188,19 +182,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--seconds", type=float, default=20)
     parser.add_argument("--messages", type=int, default=1)
-    parser.add_argument("--commit-delay-ms", type=float, default=0)
     parser.add_argument("--disk-pressure", action="store_true")
     parser.add_argument("--directory", type=Path, default=None)
     args = parser.parse_args()
-    if args.commit_delay_ms:
-        delay = args.commit_delay_ms / 1000
-        commit = SqliteDatabase.commit
-
-        def slow_commit(self):
-            time.sleep(delay)
-            return commit(self)
-
-        SqliteDatabase.commit = slow_commit
     with tempfile.TemporaryDirectory(dir=args.directory) as name:
         directory = Path(name)
         writer = None
@@ -223,7 +207,6 @@ def main() -> None:
                 "python": platform.python_version(),
                 "sqlite": sqlite3.sqlite_version,
                 "messages_per_response": args.messages,
-                "commit_delay_ms": args.commit_delay_ms,
                 "disk_pressure": args.disk_pressure,
                 **result,
             },

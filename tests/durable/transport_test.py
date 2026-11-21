@@ -127,20 +127,28 @@ async def test_connection_exhaustion_is_typed_and_preserves_cause(
 
 @pytest.mark.asyncio
 async def test_request_waits_until_what_it_depends_on_is_durable():
-    order = []
+    received = []
+    synced = asyncio.Event()
 
     async def sync(request):
-        order.append("request")
+        received.append(synced.is_set())
         return web.json_response({"ok": True})
 
     async def make_durable():
-        order.append("durable")
+        await synced.wait()
 
     async with homeserver(sync) as (url, _):
         nio_client = client()
         nio_client.homeserver = url
         try:
-            await Transport(nio_client, 1024, make_durable).request("GET", "/sync")
+            request = asyncio.create_task(
+                Transport(nio_client, 1024, make_durable).request("GET", "/sync")
+            )
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert received == []
+            synced.set()
+            await request
         finally:
             await nio_client.close()
-    assert order == ["durable", "request"]
+    assert received == [True]

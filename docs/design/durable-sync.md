@@ -330,30 +330,35 @@ unmerged prototype formats are unsupported. Normal schema version, identity,
 foreign-key, and decoded-data validation remain. Import without `fcntl` works;
 using ownership without supported locking fails clearly.
 
-Durable SQLite uses WAL with `synchronous=NORMAL`, and an fsync of the WAL
-off the event loop before any effect outside the process that depends on a
-commit. A NORMAL commit writes the WAL without waiting for the disk, so it
-survives a process crash at once. `DurableStore.make_durable()` then fsyncs the
-WAL in a worker thread, once for all commits since the last fsync, so they also
-survive power loss. Every HTTP request of the durable session (`/sync` with a
-new cursor, crypto requests, `/messages`, joins and leaves) waits for it in
-`Transport`, a batch reaches the consumer through `next_batch()` only after
-it, and `wait_for_room_ready()` returns only after it. Before this, commits
-used `synchronous=FULL`, and each one fsynced on the event loop, which on a busy
-deployment was the largest source of event-loop stalls (see
-`scripts/bench_durable_commit_lag.py`). What stays exposed to power loss is
-only in-process state the application reads directly, such as room state or a
-decryption, until the next of those effects; the server sends the same interval
-again after a restart. WAL checkpoints still fsync on the loop, once every
-thousand or so written pages. According to
-[SQLite's synchronous documentation](https://sqlite.org/pragma.html#pragma_synchronous),
-a synchronized WAL preserves committed transactions across power loss when the
-filesystem and storage honor synchronization. Process-kill tests verify crash
-atomicity; they do not simulate hardware failure. Application handoff requires
-its journal to synchronize admission before acknowledging nio; MindRoom already
-uses FULL for its SQLite writer. No claim covers lying storage, disk loss, or
-unsynchronized consumer databases. No database queue, serializer dependency, or
-generic retry framework is introduced. Whole-response JSON is decoded once per
+Durable SQLite uses WAL with `synchronous=FULL`. Measured batch preparation,
+delivery and acknowledgement for 200 encrypted events took 52.9 ms with NORMAL
+and 61.5 ms with FULL; 1,000 took 270.4 ms and 280.9 ms. That small cost buys
+SQLite's commit synchronization rather than an application protocol. According
+to [SQLite's synchronous documentation](https://sqlite.org/pragma.html#pragma_synchronous),
+WAL/FULL preserves committed transactions across power loss when the filesystem
+and storage honor synchronization. A FULL commit fsyncs on the event loop,
+though, and on a busy deployment the sync loop's commits were the largest source
+of event-loop stalls (`scripts/bench_durable_commit_lag.py` reproduces them).
+So the transactions the sync loop runs for every response (capture with
+preparation, each history page, and completion) commit with `sync_later`:
+`synchronous=NORMAL` for that commit, which writes the WAL and survives a
+process crash at once, and `DurableStore.make_durable()` fsyncs the WAL in a
+worker thread, one fsync at a time for every such commit since the last. The
+runner waits for it after each capture, before transient callbacks; every
+request of the durable `Transport` (`/sync`, crypto requests, `/messages`, joined
+members, joins and leaves), `next_batch()` and `wait_for_room_ready()` wait for
+it first. It returns only when nothing is left to sync, and a failed fsync fails
+every later call. Every other commit, including acknowledgements, device trust,
+key-share decisions and the results of joins, leaves and crypto requests, stays
+FULL and is durable when its call returns. Until such an fsync, other tasks can
+read in-memory room and crypto state that a power loss would roll back; the
+server sends that interval again after a restart. WAL checkpoints still fsync on
+the loop, once every thousand or so written pages. Process-kill tests verify
+crash atomicity; they do not simulate hardware failure. Application handoff
+requires its journal to synchronize admission before acknowledging nio; MindRoom
+already uses FULL for its SQLite writer. No claim covers lying storage, disk
+loss, or unsynchronized consumer databases. No database queue, serializer
+dependency, or generic retry framework is introduced. Whole-response JSON is decoded once per
 preparation attempt; prepared batches are encoded once and read without repeated
 canonicalization. Diagnostics exclude message payloads, credentials, and keys.
 Response-validation logs contain the response class, exception class and schema

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import threading
 from uuid import UUID
 
 import pytest
@@ -567,15 +568,46 @@ async def test_decrypted_state_never_changes_durable_membership(tmp_path, plaint
 
 
 @pytest.mark.asyncio
-async def test_room_readiness_follows_the_fsync_of_its_baseline(tmp_path, monkeypatch):
-    synced = []
-    fsync = os.fsync
-    monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd) or fsync(fd))
+async def test_room_readiness_waits_for_the_sync_of_what_made_it(tmp_path, monkeypatch):
     session = open_session(tmp_path)
     try:
         await session._accept_response(response())
-        assert synced == []
+        # Preparation leaves its commit for make_durable() to sync.
+        with session._store.transaction(sync_later=True):
+            session._store.publish(())
+        synced = []
+        fsync = os.fsync
+        monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd) or fsync(fd))
         assert await session.wait_for_room_ready(ROOM)
-        assert synced[-1] == session._store._wal
+        assert synced
     finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_room_readiness_does_not_answer_for_a_session_closed_meanwhile(
+    tmp_path, monkeypatch
+):
+    session = open_session(tmp_path)
+    started, release = threading.Event(), threading.Event()
+    try:
+        await session._accept_response(response())
+        with session._store.transaction(sync_later=True):
+            session._store.publish(())
+        fsync = os.fsync
+
+        def held(fd):
+            started.set()
+            assert release.wait(5)
+            fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", held)
+        ready = asyncio.create_task(session.wait_for_room_ready(ROOM))
+        assert await asyncio.to_thread(started.wait, 5)
+        await session.close()
+        release.set()
+        with pytest.raises(LocalProtocolError):
+            await ready
+    finally:
+        release.set()
         await session.close()

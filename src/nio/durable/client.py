@@ -242,6 +242,8 @@ class DurableSync:
         transients = await self._capture_response(
             body, full_state=full_state, newly_joined_room=newly_joined_room
         )
+        # Sync the capture before the room state it hands to callbacks.
+        await self._store.make_durable()
         await deliver_transients(self.client, transients)
 
     def _change_membership(self, room_id: str, membership: str) -> OwnMembership | None:
@@ -466,7 +468,7 @@ class DurableSync:
                     ):
                         continue
                     await self._maintain_crypto()
-                    with self._store.transaction():
+                    with self._store.transaction(sync_later=True):
                         self._complete_input()
                     self._changed.set()
                     continue
@@ -646,9 +648,12 @@ class DurableSync:
         self._assert_active()
         while self._metadata.get(room_id, {}).get("membership") == "join":
             if self._room_ready(room_id):
-                # The caller may now send what this readiness allows.
+                # Answer only from durable state: check again after the sync.
                 await self._store.make_durable()
-                return True
+                self._assert_active()
+                if self._room_ready(room_id):
+                    return True
+                continue
             self._changed.clear()
             await self._changed.wait()
             self._assert_active()

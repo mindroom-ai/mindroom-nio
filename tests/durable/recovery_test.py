@@ -88,6 +88,7 @@ async def test_recovery_orders_tenures_and_resets_rejoin_projection(tmp_path):
         nio_client.homeserver = url
         session = open_session(tmp_path, nio_client)
         await baseline(session)
+        commits = session._store._commits
         await session._capture_response(limited())
         session._quiescing = True
         runner = asyncio.create_task(session.run())
@@ -116,6 +117,9 @@ async def test_recovery_orders_tenures_and_resets_rejoin_projection(tmp_path):
             assert set(nio_client.rooms[ROOM].users) == {USER}
             assert session.cursor == "s2"
             assert len([p for p, _ in requests if p.endswith("/messages")]) == 1
+            # Capture, the history page, the tail and completion left their
+            # fsync to make_durable().
+            assert session._store._commits - commits == 4
         finally:
             await session.close()
             await nio_client.close()

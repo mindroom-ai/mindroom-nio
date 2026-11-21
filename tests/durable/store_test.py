@@ -1,7 +1,10 @@
 """Crash boundaries and ownership of the compact durable store."""
 
+import asyncio
+import errno
 import os
 import shutil
+import threading
 from uuid import UUID
 
 import pytest
@@ -273,33 +276,118 @@ def test_preexisting_default_handle_cannot_change_trust_after_adoption(tmp_path)
         ordinary.verify_device(device)
 
 
-@pytest.mark.asyncio
-async def test_commits_become_durable_through_one_wal_fsync(tmp_path, monkeypatch):
-    synced = []
-    fsync = os.fsync
-    monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd) or fsync(fd))
+def test_durable_writer_uses_full_synchronous_on_open_and_reopen(tmp_path):
     for _ in range(2):
         store = open_store(tmp_path)
         try:
-            assert store.database.execute_sql("PRAGMA synchronous").fetchone()[0] == 1
+            assert store.database.execute_sql("PRAGMA synchronous").fetchone()[0] == 2
             assert (
                 store.database.execute_sql("PRAGMA journal_mode").fetchone()[0] == "wal"
             )
-            # A process crash keeps NORMAL commits; power loss needs the WAL fsync.
-            del synced[:]
-            for _ in range(2):
-                with store.transaction():
-                    store.publish((message(),))
-            await store.make_durable()
-            # The first one also syncs the directory entry of the new WAL.
-            assert len(synced) == 2
-            await store.make_durable()
-            with store.transaction():
-                store.publish(())
-            await store.make_durable()
-            assert synced[1:] == [store._wal, store._wal]
         finally:
             store.close()
+
+
+def synchronous(store):
+    return store.database.execute_sql("PRAGMA synchronous").fetchone()[0]
+
+
+@pytest.mark.asyncio
+async def test_sync_later_commits_share_one_off_loop_wal_fsync(tmp_path, monkeypatch):
+    store = open_store(tmp_path)
+    try:
+        with store.transaction(sync_later=True):
+            assert synchronous(store) == 1
+            store.publish((message(),))
+        with store.transaction(sync_later=True):
+            store.publish(())
+        with store.transaction():
+            assert synchronous(store) == 2
+            store.publish(())
+        synced = []
+        fsync = os.fsync
+        monkeypatch.setattr(
+            os, "fsync", lambda fd: synced.append(os.fstat(fd).st_ino) or fsync(fd)
+        )
+        await store.make_durable()
+        await store.make_durable()
+        # One fsync covers both commits; the first also syncs the new WAL's
+        # directory entry.
+        wal = os.stat(f"{store.path}-wal").st_ino
+        assert synced == [os.stat(tmp_path).st_ino, wal]
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_make_durable_returns_only_when_nothing_is_left_to_sync(
+    tmp_path, monkeypatch
+):
+    store = open_store(tmp_path)
+    try:
+        with store.transaction(sync_later=True):
+            store.publish((message(),))
+        started, release, calls = threading.Event(), threading.Event(), []
+        fsync = os.fsync
+
+        def held(fd):
+            calls.append(fd)
+            if len(calls) == 2:
+                started.set()
+                assert release.wait(5)
+            fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", held)
+        first = asyncio.create_task(store.make_durable())
+        assert await asyncio.to_thread(started.wait, 5)
+        # A commit lands while the WAL fsync is in flight.
+        with store.transaction(sync_later=True):
+            store.publish((message("$two"),))
+        second = asyncio.create_task(store.make_durable())
+        release.set()
+        await first
+        assert store._synced == store._commits
+        await second
+        # The directory, the WAL, then the WAL again for the second commit.
+        assert len(calls) == 3
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_wal_fsync_fails_every_later_sync(tmp_path, monkeypatch):
+    store = open_store(tmp_path)
+    try:
+        with store.transaction(sync_later=True):
+            store.publish(())
+
+        def fail(fd):
+            raise OSError(errno.EIO, "lost write")
+
+        monkeypatch.setattr(os, "fsync", fail)
+        with pytest.raises(OSError, match="lost write"):
+            await store.make_durable()
+        monkeypatch.undo()
+        # The kernel may not report the lost write again.
+        with pytest.raises(LocalProtocolError, match="could not sync"):
+            await store.make_durable()
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_the_wal_of_a_symlinked_database_is_synced(tmp_path):
+    (tmp_path / "data").mkdir()
+    (tmp_path / "store").mkdir()
+    (tmp_path / "store" / "link.db").symlink_to(tmp_path / "data" / "real.db")
+    store = open_store(tmp_path / "store", database_name="link.db")
+    try:
+        with store.transaction(sync_later=True):
+            store.publish(())
+        await store.make_durable()
+        assert (tmp_path / "data" / "real.db-wal").exists()
+    finally:
+        store.close()
 
 
 def durable_ack(store):

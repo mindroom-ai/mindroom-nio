@@ -215,7 +215,7 @@ class Recovery:
         if state.get("phase") == "recover":
             return
         try:
-            with session._store.transaction():
+            with session._store.transaction(sync_later=True):
                 if new_input is not None:
                     session._store.capture(new_input[0])
                 if "phase" not in state:
@@ -606,7 +606,7 @@ class Recovery:
     ) -> None:
         session = self.session
         try:
-            with session._store.transaction():
+            with session._store.transaction(sync_later=True):
                 processor = Processor(
                     session,
                     state["history_rooms"],

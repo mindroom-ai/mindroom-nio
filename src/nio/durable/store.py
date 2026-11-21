@@ -110,9 +110,11 @@ class DurableStore:
         self._loop_state: _LoopState | None = None
         # An acknowledged empty batch whose deletion the next commit writes.
         self._deferred_ack: int | None = None
-        # Commits so far, and how many of them an fsync of the WAL covers.
+        # Commits that skipped their fsync, and how many of them one covers.
         self._commits = self._synced = 0
-        self._wal: int | None = None
+        self._syncing = asyncio.Lock()
+        self._sync_error: OSError | None = None
+        self._wal_path: str | None = None
         self._wal_entry_synced = False
         self._lease = FileLease(self.path)
         self.database = _Database(
@@ -164,8 +166,11 @@ class DurableStore:
                     self._create_schema(consumer_id, user_id, device_id)
                     if source_store_class is DefaultStore:
                         self._adopt_trust(user_id, device_id)
-            self.database.execute_sql("PRAGMA journal_mode=WAL")
-            self.database.execute_sql("PRAGMA synchronous=NORMAL")
+            mode = self.database.execute_sql("PRAGMA journal_mode=WAL").fetchone()
+            if mode[0] == "wal":
+                # SQLite names the WAL after the file a symlink resolves to.
+                self._wal_path = os.path.realpath(self.path) + "-wal"
+            self.database.execute_sql("PRAGMA synchronous=FULL")
         except BaseException:
             self.close()
             raise
@@ -259,7 +264,14 @@ class DurableStore:
             raise LocalProtocolError("durable mutation requires a transaction")
 
     @contextmanager
-    def transaction(self) -> Iterator[None]:
+    def transaction(self, *, sync_later: bool = False) -> Iterator[None]:
+        """Run one transaction, or a savepoint inside an open one.
+
+        With ``sync_later``, an outermost commit skips its fsync, so it
+        survives a process crash but not yet power loss; ``make_durable()``
+        then syncs it off the event loop. Use it only for commits whose every
+        effect outside the process waits for ``make_durable()``.
+        """
         self._assert_open()
         if not self._transaction_depth and self.database.in_transaction():
             raise LocalProtocolError(
@@ -267,14 +279,18 @@ class DurableStore:
             )
         self._transaction_depth += 1
         self._invalidate_local_intent()
+        later = sync_later and self._transaction_depth == 1 and bool(self._wal_path)
         try:
             outermost = self._transaction_depth == 1
+            if later:
+                self.database.execute_sql("PRAGMA synchronous=NORMAL")
             with self.database.atomic("IMMEDIATE"):
                 if outermost and self._deferred_ack is not None:
                     self._save_ack(self._deferred_ack)
                 yield
             if outermost:
                 self._deferred_ack = None
+            if later:
                 self._commits += 1
         except BaseException:
             # A failed commit or nested rollback invalidates speculative writes.
@@ -283,35 +299,51 @@ class DurableStore:
             self._loop_state = None
             raise
         finally:
+            if later:
+                self.database.execute_sql("PRAGMA synchronous=FULL")
             self._transaction_depth -= 1
             self._invalidate_local_intent()
 
     async def make_durable(self) -> None:
-        """Wait, off the event loop, until every commit so far survives power loss.
+        """Wait, off the event loop, until every ``sync_later`` commit is synced.
 
-        Commits use synchronous=NORMAL: they reach the WAL without an fsync and
-        survive a process crash at once. Call this before any effect outside
-        the process that depends on them.
+        Call it before any effect outside the process that depends on such a
+        commit. It returns only once nothing is left to sync, so code that
+        reads the store right after it, without awaiting, sees durable state.
+        A failed fsync fails every later call.
         """
-        self._assert_open()
-        commits = self._commits
-        if self._synced < commits:
-            if self._wal is None:
-                self._wal = os.open(f"{self.path}-wal", os.O_RDONLY)
-            await asyncio.to_thread(self._fsync, self._wal)
-            self._synced = max(self._synced, commits)
+        async with self._syncing:
+            while self._synced < self._commits:
+                self._assert_open()
+                if self._sync_error is not None:
+                    raise LocalProtocolError(
+                        "durable store could not sync its WAL"
+                    ) from self._sync_error
+                commits = self._commits
+                try:
+                    await asyncio.to_thread(self._fsync)
+                except OSError as error:
+                    # The kernel may report a lost write only once.
+                    self._sync_error = error
+                    raise
+                self._synced = commits
 
-    def _fsync(self, wal: int) -> None:
+    def _fsync(self) -> None:
+        assert self._wal_path is not None
         if not self._wal_entry_synced:
             # SQLite syncs a new WAL's directory entry when it first syncs the
-            # WAL, which synchronous=NORMAL leaves to checkpoints.
-            directory = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            # WAL, which a sync_later commit leaves to later.
+            self._fsync_path(os.path.dirname(self._wal_path))
             self._wal_entry_synced = True
-        os.fsync(wal)
+        self._fsync_path(self._wal_path)
+
+    @staticmethod
+    def _fsync_path(path: str) -> None:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def load_room_metadata(self) -> dict[str, str]:
         self._assert_open()
@@ -570,8 +602,6 @@ class DurableStore:
         if not self.database.is_closed():
             self.database.close()
         self.database.revoked = True
-        if self._wal is not None:
-            os.close(self._wal)
         self._closed = True
         self._loop_state = None
         self._lease.close()
