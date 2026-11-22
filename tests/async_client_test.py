@@ -6479,8 +6479,9 @@ class TestClass:
             method in {"PUT", "DELETE"} for method, _url in aioresponse.requests
         )
 
+    @pytest.mark.parametrize("failed_read", ["old-room", "new-room"])
     async def test_room_upgrade_returns_error_on_alias_failure(
-        self, async_client, aioresponse
+        self, async_client, aioresponse, failed_read
     ):
         room_create_event_dict = {
             "content": {"creator": ALICE_ID, "room_version": "10"},
@@ -6544,21 +6545,47 @@ class TestClass:
             payload=[room_create_event_dict, power_levels_event_dict],
             repeat=True,
         )
+        new_room_id = "!new:example.org"
         aioresponse.post(
             f"{BASE_URL_V3}/createRoom",
             status=200,
-            payload=self.room_id_response(TEST_ROOM_ID_V12),
+            payload=self.room_id_response(new_room_id),
         )
         aioresponse.put(
             f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.tombstone",
             status=200,
             payload={"event_id": "$tombstone_event_id"},
         )
-        aioresponse.get(
-            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
-            status=503,
-            payload={"errcode": "M_UNKNOWN", "error": "backend unavailable"},
-        )
+        unavailable = {"errcode": "M_FORBIDDEN", "error": "backend unavailable"}
+        if failed_read == "old-room":
+            aioresponse.get(
+                f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
+                status=503,
+                payload=unavailable,
+            )
+        else:
+            # The old room's aliases move away, then reading the new room's fails.
+            aioresponse.get(
+                f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
+                status=200,
+                payload={"alias": "#old:example.org"},
+                repeat=True,
+            )
+            aioresponse.delete(
+                f"{BASE_URL_V3}/directory/room/%23old%3Aexample.org",
+                status=200,
+                payload={},
+            )
+            aioresponse.put(
+                f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
+                status=200,
+                payload={"event_id": "$alias_event_id"},
+            )
+            aioresponse.get(
+                f"{BASE_URL_V3}/rooms/{new_room_id}/state/m.room.canonical_alias",
+                status=503,
+                payload=unavailable,
+            )
 
         response = await async_client.room_upgrade(TEST_ROOM_ID, "12")
 

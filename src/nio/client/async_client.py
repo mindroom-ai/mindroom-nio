@@ -344,6 +344,22 @@ async def _cancel_and_drain_tasks(tasks: Sequence[asyncio.Future[Any]]) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+def _alias_read_failure(result: Any) -> RoomUpgradeError | None:
+    """Return an upgrade error for an alias update that failed reading the room's aliases.
+
+    Only that read failure carries an HTTP status; write failures keep their old handling.
+    """
+    if isinstance(result, RoomUpdateAliasError) and result.http_status is not None:
+        return RoomUpgradeError(
+            result.message,
+            result.status_code,
+            result.retry_after_ms,
+            result.soft_logout,
+            http_status=result.http_status,
+        )
+    return None
+
+
 async def on_request_chunk_sent(session, context, params):
     """TraceConfig callback to run when a chunk is sent for client uploads."""
 
@@ -4777,21 +4793,22 @@ class AsyncClient(Client):
                 alt_aliases = []
 
             # Remove the old aliases
-            if isinstance(
-                await self.room_update_aliases(old_room_id), RoomDeleteAliasError
-            ):
+            removed = await self.room_update_aliases(old_room_id)
+            if isinstance(removed, RoomDeleteAliasError):
                 return RoomUpgradeError("Could update the old rooms aliases")
+            if failed_read := _alias_read_failure(removed):
+                return failed_read
 
             # Assign new aliases
-            if isinstance(
-                await self.room_update_aliases(
-                    new_room.room_id,
-                    canonical_alias=old_room_alias.content["alias"],
-                    alt_aliases=alt_aliases,
-                ),
-                RoomDeleteAliasError,
-            ):
+            assigned = await self.room_update_aliases(
+                new_room.room_id,
+                canonical_alias=old_room_alias.content["alias"],
+                alt_aliases=alt_aliases,
+            )
+            if isinstance(assigned, RoomDeleteAliasError):
                 return RoomUpgradeError("Could update the new rooms aliases")
+            if failed_read := _alias_read_failure(assigned):
+                return failed_read
 
         return RoomUpgradeResponse(new_room.room_id)
 
