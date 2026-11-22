@@ -4778,7 +4778,7 @@ class AsyncClient(Client):
 
             # Remove the old aliases
             if isinstance(
-                await self.room_update_aliases(old_room_id), RoomUpdateAliasError
+                await self.room_update_aliases(old_room_id), RoomDeleteAliasError
             ):
                 return RoomUpgradeError("Could update the old rooms aliases")
 
@@ -4789,7 +4789,7 @@ class AsyncClient(Client):
                     canonical_alias=old_room_alias.content["alias"],
                     alt_aliases=alt_aliases,
                 ),
-                RoomUpdateAliasError,
+                RoomDeleteAliasError,
             ):
                 return RoomUpgradeError("Could update the new rooms aliases")
 

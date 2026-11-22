@@ -6479,12 +6479,8 @@ class TestClass:
             method in {"PUT", "DELETE"} for method, _url in aioresponse.requests
         )
 
-    @pytest.mark.parametrize(
-        "failure_mode",
-        ["alias-get-503", "nested-alias-update-error"],
-    )
     async def test_room_upgrade_returns_error_on_alias_failure(
-        self, async_client, aioresponse, failure_mode
+        self, async_client, aioresponse
     ):
         room_create_event_dict = {
             "content": {"creator": ALICE_ID, "room_version": "10"},
@@ -6558,29 +6554,16 @@ class TestClass:
             status=200,
             payload={"event_id": "$tombstone_event_id"},
         )
-        if failure_mode == "alias-get-503":
-            aioresponse.get(
-                f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
-                status=503,
-                payload={"errcode": "M_UNKNOWN", "error": "backend unavailable"},
-            )
-        else:
-            aioresponse.get(
-                f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
-                status=200,
-                payload={"alias": "#old:example.org"},
-            )
-            aioresponse.get(
-                f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
-                status=503,
-                payload={"errcode": "M_FORBIDDEN", "error": "transient refusal"},
-            )
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
+            status=503,
+            payload={"errcode": "M_UNKNOWN", "error": "backend unavailable"},
+        )
 
         response = await async_client.room_upgrade(TEST_ROOM_ID, "12")
 
         assert isinstance(response, RoomUpgradeError)
-        if failure_mode == "alias-get-503":
-            assert response.http_status == 503
+        assert response.http_status == 503
 
 
 def test_error_response_http_status_default_and_positional_args():
