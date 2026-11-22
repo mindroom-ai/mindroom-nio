@@ -6479,7 +6479,7 @@ class TestClass:
             method in {"PUT", "DELETE"} for method, _url in aioresponse.requests
         )
 
-    @pytest.mark.parametrize("failed_read", ["old-room", "new-room"])
+    @pytest.mark.parametrize("failed_read", ["old-room", "old-room-nested", "new-room"])
     async def test_room_upgrade_returns_error_on_alias_failure(
         self, async_client, aioresponse, failed_read
     ):
@@ -6558,6 +6558,18 @@ class TestClass:
         )
         unavailable = {"errcode": "M_FORBIDDEN", "error": "backend unavailable"}
         if failed_read == "old-room":
+            aioresponse.get(
+                f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
+                status=503,
+                payload=unavailable,
+            )
+        elif failed_read == "old-room-nested":
+            # The upgrade reads the old alias, then the alias update's own read fails.
+            aioresponse.get(
+                f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
+                status=200,
+                payload={"alias": "#old:example.org"},
+            )
             aioresponse.get(
                 f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
                 status=503,
