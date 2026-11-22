@@ -656,10 +656,9 @@ class AsyncClient(Client):
                         await f.write(chunk)
                 file_body = destination
             resp = response_class.from_data(file_body, content_type, name)
-        elif (
-            issubclass(response_class, RoomGetStateEventResponse)
-            and transport_response.status == 404
-        ):
+        elif issubclass(
+            response_class, RoomGetStateEventResponse
+        ) and transport_response.status not in range(200, 300):
             parsed_dict = await self.parse_body(transport_response)
             resp = response_class.create_error(parsed_dict, factory_args[-1])
 
@@ -675,6 +674,8 @@ class AsyncClient(Client):
             resp = response_factory.from_dict(parsed_dict, *factory_args)
 
         resp.transport_response = transport_response
+        if isinstance(resp, ErrorResponse):
+            resp.http_status = transport_response.status
         return resp
 
     def _iter_to_device(

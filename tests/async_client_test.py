@@ -95,6 +95,7 @@ from nio import (
     RoomForgetResponse,
     RoomGetEventError,
     RoomGetEventResponse,
+    RoomGetStateEventError,
     RoomGetStateEventResponse,
     RoomGetStateResponse,
     RoomGetVisibilityResponse,
@@ -109,6 +110,7 @@ from nio import (
     RoomMessagesResponse,
     RoomMessageText,
     RoomPutAliasResponse,
+    RoomPutStateError,
     RoomPutStateResponse,
     RoomReadMarkersResponse,
     RoomRedactResponse,
@@ -157,6 +159,7 @@ from nio.client.async_client import connect_wrapper, on_request_chunk_sent
 from nio.crypto import OlmDevice, Session, decrypt_attachment
 from nio.responses import (
     PublicRoom,
+    _ErrorWithRoomId,
     PublicRoomsResponse,
     RoomUpgradeError,
     SlidingSyncResponse,
@@ -1919,6 +1922,75 @@ class TestClass:
         )
 
         assert isinstance(resp, RoomGetStateEventResponse)
+
+    @pytest.mark.parametrize(
+        ("http_status", "errcode"),
+        [
+            (404, "M_NOT_FOUND"),
+            (503, "M_NOT_FOUND"),
+            (403, "M_FORBIDDEN"),
+        ],
+    )
+    async def test_room_get_state_event_error(
+        self, async_client, aioresponse, http_status, errcode
+    ):
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.name",
+            status=http_status,
+            payload={"errcode": errcode, "error": "request failed"},
+        )
+
+        resp = await async_client.room_get_state_event(
+            room_id=TEST_ROOM_ID, event_type="m.room.name", state_key=""
+        )
+
+        assert isinstance(resp, RoomGetStateEventError)
+        assert resp.status_code == errcode
+        assert resp.http_status == http_status
+        assert resp.room_id == TEST_ROOM_ID
+
+    async def test_room_get_state_event_non_json_error(self, async_client, aioresponse):
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.name",
+            status=502,
+            body="<html>bad gateway</html>",
+            content_type="text/html",
+        )
+
+        resp = await async_client.room_get_state_event(
+            room_id=TEST_ROOM_ID, event_type="m.room.name", state_key=""
+        )
+
+        assert isinstance(resp, RoomGetStateEventError)
+        assert resp.http_status == 502
+
+    @pytest.mark.parametrize(
+        ("http_status", "errcode"),
+        [
+            (503, "M_FORBIDDEN"),
+            (403, "M_FORBIDDEN"),
+        ],
+    )
+    async def test_room_put_state_error_http_status(
+        self, async_client, aioresponse, http_status, errcode
+    ):
+        aioresponse.put(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/org.example.event_type",
+            status=http_status,
+            payload={"errcode": errcode, "error": "cannot write state"},
+        )
+
+        resp = await async_client.room_put_state(
+            room_id=TEST_ROOM_ID,
+            event_type="org.example.event_type",
+            content={},
+            state_key="",
+        )
+
+        assert isinstance(resp, RoomPutStateError)
+        assert resp.status_code == errcode
+        assert resp.http_status == http_status
+        assert resp.room_id == TEST_ROOM_ID
 
     async def test_room_get_state(self, async_client, aioresponse):
         aioresponse.get(
@@ -6294,3 +6366,20 @@ class TestClass:
         assert not any(
             method in {"POST", "PUT", "DELETE"} for method, _url in aioresponse.requests
         )
+
+
+def test_error_response_http_status_default_and_positional_args():
+    hand_built = ErrorResponse("boom", "M_UNKNOWN")
+    assert hand_built.http_status is None
+
+    explicit = RoomGetStateEventError(
+        "x", "M_NOT_FOUND", room_id=TEST_ROOM_ID, http_status=404
+    )
+    assert explicit.room_id == TEST_ROOM_ID
+    assert explicit.http_status == 404
+
+    parsed = _ErrorWithRoomId.from_dict(
+        {"errcode": "M_FORBIDDEN", "error": "denied"}, TEST_ROOM_ID
+    )
+    assert parsed.room_id == TEST_ROOM_ID
+    assert parsed.http_status is None
