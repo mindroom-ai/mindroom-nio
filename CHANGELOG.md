@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 1.4.4
+
+- `ErrorResponse.http_status` holds the HTTP status of the answer an error was parsed from, so callers can tell a 5xx whose body carries `M_FORBIDDEN` or `M_NOT_FOUND` from a real refusal or absence. `room_get_state_event` returns `RoomGetStateEventError` for every non-2xx status, not only 404; before, a 403 or 5xx came back as a successful response whose content was the error body. `room_update_aliases`, `room_upgrade`, `has_permission` and `has_event_permission` treat only a 404 as absence and return the failed read otherwise.
+- **Breaking:** `DurableSync.change_membership()` raises `HttpError` (with `status` and `errcode`) when the homeserver rejects the join or leave, after clearing the local intent so the next command can run. `False` now only means the local position was stale and nothing was sent.
+
 ## 1.4.3
 
 - Encrypted `room_send` and `room_encrypt` retry their encryption preparation once when durable sync invalidates the room's recipients mid-preparation, for example when a sync echo carries an unchanged member event. The durable outbound raise sites now raise `RoomRecipientsChangedError`, a `LocalProtocolError` subclass. The retry checks again that the room is joined and encrypted, rebuilds recipients from fresh state and goes through the public `share_group_session`; the room-event `/send` is never retried and nothing falls back to plaintext.
