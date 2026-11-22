@@ -481,7 +481,10 @@ class DurableSync:
                     and not self._local_lock.locked()
                 ):
                     async with self._local_lock:
-                        await self._apply_local_intent(local)
+                        try:
+                            await self._apply_local_intent(local)
+                        except HttpError:
+                            pass
                     continue
                 await self._source_ready.wait()
                 if self._store.has_batches():
@@ -658,7 +661,12 @@ class DurableSync:
         previous_epoch: int,
         current_membership: str,
     ) -> bool:
-        """Retain a local join/leave before HTTP; consumer draining must continue."""
+        """Retain a local join/leave before HTTP; consumer draining must continue.
+
+        Returns True when the change is applied, or False when the local position
+        is stale and nothing was sent. Raises HttpError (with status and errcode)
+        when the homeserver answers with a failure, after clearing the local intent.
+        """
         self._assert_active()
         if self.config.to_device_only:
             raise LocalProtocolError("to-device-only sync cannot own room membership")
@@ -729,7 +737,7 @@ class DurableSync:
             with self._store.transaction():
                 self._store.delete_local_intent()
             self._changed.set()
-            return False
+            raise
         self._assert_active()
         try:
             with self._store.transaction():

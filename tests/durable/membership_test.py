@@ -6,6 +6,8 @@ from uuid import UUID
 import pytest
 from aiohttp import web
 
+from nio.durable.transport import HttpError
+
 from .client_test import ROOM, client, open_session, response
 from .runner_test import drain_sync, homeserver
 
@@ -584,3 +586,130 @@ async def test_local_command_discards_completed_poll_before_acceptance(
         await asyncio.gather(command, return_exceptions=True)
         await session.close()
         await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_change_membership_raises_http_error_and_clears_local_intent(tmp_path):
+    other_room = "!other:example.org"
+    stop = asyncio.Event()
+    calls = []
+
+    async def sync(request):
+        if request.query.get("since"):
+            await stop.wait()
+        return web.Response(body=response())
+
+    async def membership(request):
+        calls.append((request.method, request.path))
+        if len(calls) == 1:
+            return web.json_response(
+                {"errcode": "M_FORBIDDEN", "error": "You are not invited to this room"},
+                status=403,
+            )
+        return web.json_response({})
+
+    async with homeserver(sync, membership=membership) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        runner = asyncio.create_task(session.run())
+        try:
+            await drain_sync(session)
+            with pytest.raises(HttpError) as failure:
+                await session.change_membership(
+                    operation_id=OPERATION,
+                    room_id=other_room,
+                    previous_membership=None,
+                    previous_epoch=0,
+                    current_membership="join",
+                )
+            assert failure.value.status == 403
+            assert failure.value.errcode == "M_FORBIDDEN"
+            assert "status=403 errcode=M_FORBIDDEN" in str(failure.value)
+            assert session._read_local_intent() is None
+
+            applied = await session.change_membership(
+                operation_id=UUID("11111111-1111-1111-1111-111111111111"),
+                room_id=other_room,
+                previous_membership=None,
+                previous_epoch=0,
+                current_membership="join",
+            )
+            assert applied is True
+            assert len(calls) == 2
+        finally:
+            stop.set()
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_recovery_replay_of_refused_local_intent_does_not_crash_runner(tmp_path):
+    other_room = "!other:example.org"
+    accepted = asyncio.Event()
+    release = asyncio.Event()
+    replayed = asyncio.Event()
+    stop = asyncio.Event()
+    calls = []
+
+    async def sync(request):
+        if request.query.get("since"):
+            await stop.wait()
+        return web.Response(body=response())
+
+    async def membership(request):
+        calls.append((request.method, request.path))
+        if len(calls) == 1:
+            accepted.set()
+            await release.wait()
+            return web.json_response({})
+        replayed.set()
+        return web.json_response(
+            {"errcode": "M_FORBIDDEN", "error": "You are not invited to this room"},
+            status=403,
+        )
+
+    async with homeserver(sync, membership=membership) as (url, _):
+        nio_client = client()
+        nio_client.homeserver = url
+        session = open_session(tmp_path, nio_client)
+        runner = asyncio.create_task(session.run())
+        try:
+            await drain_sync(session)
+            operation = asyncio.create_task(
+                session.change_membership(
+                    operation_id=OPERATION,
+                    room_id=other_room,
+                    previous_membership=None,
+                    previous_epoch=0,
+                    current_membership="join",
+                )
+            )
+            async with asyncio.timeout(5):
+                await accepted.wait()
+            operation.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await operation
+        finally:
+            await session.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)
+        release.set()
+
+        nio_client = client()
+        nio_client.homeserver = url
+        reopened = open_session(tmp_path, nio_client)
+        runner = asyncio.create_task(reopened.run())
+        try:
+            async with asyncio.timeout(5):
+                await replayed.wait()
+                await reopened.quiesce()
+                await runner
+            assert reopened._read_local_intent() is None
+            assert len(calls) == 2
+        finally:
+            stop.set()
+            await reopened.close()
+            await nio_client.close()
+            await asyncio.gather(runner, return_exceptions=True)

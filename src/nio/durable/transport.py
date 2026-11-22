@@ -19,7 +19,8 @@ class HttpError(LocalProtocolError):
     def __init__(self, status: int, errcode: str | None = None):
         self.status = status
         self.errcode = errcode
-        super().__init__(f"durable HTTP request failed: status={status}")
+        detail = f"status={status} errcode={errcode}" if errcode else f"status={status}"
+        super().__init__(f"durable HTTP request failed: {detail}")
 
 
 class ConnectionRetriesExhausted(LocalProtocolError):
