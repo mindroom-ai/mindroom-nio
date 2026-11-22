@@ -227,7 +227,9 @@ Compare generations to detect progress; the value is not a batch sequence or a c
 `cursor` exposes the last prepared Matrix position.
 
 `change_membership(operation_id, room_id, previous_membership, previous_epoch,
-current_membership)` accepts keyword arguments and returns success as a boolean.
+current_membership)` accepts keyword arguments, returns `True` when applied or
+`False` only for a stale local position (sending nothing), and raises
+`HttpError` on a homeserver rejection after clearing the local intent.
 Only join and leave are local targets. The application reads its current journal
 position after `wait_for_membership_idle()` and supplies that expected position;
 a stale expectation cannot authorize a newer transition.

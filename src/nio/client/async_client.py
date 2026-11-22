@@ -1088,7 +1088,11 @@ class AsyncClient(Client):
         )
         if isinstance(resp, RegisterInteractiveError):
             return RegisterErrorResponse(
-                resp.message, resp.status_code, resp.retry_after_ms, resp.soft_logout
+                resp.message,
+                resp.status_code,
+                resp.retry_after_ms,
+                resp.soft_logout,
+                http_status=resp.http_status,
             )
 
         # use session token to register with token
@@ -1104,7 +1108,11 @@ class AsyncClient(Client):
         )
         if isinstance(resp, RegisterInteractiveError):
             return RegisterErrorResponse(
-                resp.message, resp.status_code, resp.retry_after_ms, resp.soft_logout
+                resp.message,
+                resp.status_code,
+                resp.retry_after_ms,
+                resp.soft_logout,
+                http_status=resp.http_status,
             )
 
         # finally call register with dummy auth with original session token
@@ -2221,7 +2229,10 @@ class AsyncClient(Client):
                 return await self._durable_session._outbound.joined_members(room_id)
             except HttpError as error:
                 return JoinedMembersError(
-                    str(error), status_code=error.errcode, room_id=room_id
+                    str(error),
+                    status_code=error.errcode,
+                    room_id=room_id,
+                    http_status=error.status,
                 )
         method, path = Api.joined_members(self.access_token, room_id)
 
@@ -3565,7 +3576,11 @@ class AsyncClient(Client):
         if isinstance(response, RoomSendEphemeralResponse) and (
             transport is not None and not transport.ok
         ):
-            error = RoomSendEphemeralError(f"HTTP {transport.status}", room_id=room_id)
+            error = RoomSendEphemeralError(
+                f"HTTP {transport.status}",
+                room_id=room_id,
+                http_status=transport.status,
+            )
             error.transport_response = transport
             return error
         return response
@@ -4588,7 +4603,16 @@ class AsyncClient(Client):
         current_alias_event = await self.room_get_state_event(
             room_id, "m.room.canonical_alias"
         )
-        if isinstance(current_alias_event, RoomGetStateEventResponse):
+        if isinstance(current_alias_event, RoomGetStateEventError):
+            if current_alias_event.http_status != 404:
+                return RoomUpdateAliasError(
+                    current_alias_event.message,
+                    current_alias_event.status_code,
+                    current_alias_event.retry_after_ms,
+                    current_alias_event.soft_logout,
+                    http_status=current_alias_event.http_status,
+                )
+        elif isinstance(current_alias_event, RoomGetStateEventResponse):
             current_aliases.append(current_alias_event.content["alias"])
             if "alt_aliases" in current_alias_event.content:
                 alt_aliases = current_alias_event.content["alt_aliases"]
@@ -4735,7 +4759,16 @@ class AsyncClient(Client):
         old_room_alias = await self.room_get_state_event(
             old_room_id, "m.room.canonical_alias"
         )
-        if isinstance(old_room_alias, RoomGetStateEventResponse):
+        if isinstance(old_room_alias, RoomGetStateEventError):
+            if old_room_alias.http_status != 404:
+                return RoomUpgradeError(
+                    "Failed to get m.room.canonical_alias",
+                    old_room_alias.status_code,
+                    old_room_alias.retry_after_ms,
+                    old_room_alias.soft_logout,
+                    http_status=old_room_alias.http_status,
+                )
+        elif isinstance(old_room_alias, RoomGetStateEventResponse):
             aliases = [old_room_alias.content["alias"]]
             if "alt_aliases" in old_room_alias.content:
                 alt_aliases = old_room_alias.content["alt_aliases"]
@@ -4745,7 +4778,7 @@ class AsyncClient(Client):
 
             # Remove the old aliases
             if isinstance(
-                await self.room_update_aliases(old_room_id), RoomDeleteAliasError
+                await self.room_update_aliases(old_room_id), RoomUpdateAliasError
             ):
                 return RoomUpgradeError("Could update the old rooms aliases")
 
@@ -4756,7 +4789,7 @@ class AsyncClient(Client):
                     canonical_alias=old_room_alias.content["alias"],
                     alt_aliases=alt_aliases,
                 ),
-                RoomDeleteAliasError,
+                RoomUpdateAliasError,
             ):
                 return RoomUpgradeError("Could update the new rooms aliases")
 
@@ -4800,6 +4833,8 @@ class AsyncClient(Client):
             return True
 
         power_levels = await self.room_get_state_event(room_id, "m.room.power_levels")
+        if isinstance(power_levels, RoomGetStateEventError):
+            return power_levels
 
         try:
             user_power_level = power_levels.content["users"][who_am_i.user_id]
@@ -4836,6 +4871,8 @@ class AsyncClient(Client):
             return True
 
         power_levels = await self.room_get_state_event(room_id, "m.room.power_levels")
+        if isinstance(power_levels, RoomGetStateEventError):
+            return power_levels
 
         try:
             user_power_level = power_levels.content["users"][who_am_i.user_id]
