@@ -95,6 +95,7 @@ from nio import (
     RoomForgetResponse,
     RoomGetEventError,
     RoomGetEventResponse,
+    RoomGetStateEventError,
     RoomGetStateEventResponse,
     RoomGetStateResponse,
     RoomGetVisibilityResponse,
@@ -109,6 +110,7 @@ from nio import (
     RoomMessagesResponse,
     RoomMessageText,
     RoomPutAliasResponse,
+    RoomPutStateError,
     RoomPutStateResponse,
     RoomReadMarkersResponse,
     RoomRedactResponse,
@@ -157,7 +159,10 @@ from nio.client.async_client import connect_wrapper, on_request_chunk_sent
 from nio.crypto import OlmDevice, Session, decrypt_attachment
 from nio.responses import (
     PublicRoom,
+    _ErrorWithRoomId,
     PublicRoomsResponse,
+    RegisterErrorResponse,
+    RoomUpdateAliasError,
     RoomUpgradeError,
     SlidingSyncResponse,
     WhoamiError,
@@ -462,6 +467,36 @@ class TestClass:
 
         assert isinstance(resp, RegisterResponse)
         assert unauthed_async_client.access_token
+
+    @pytest.mark.parametrize("fail_step", [1, 2])
+    async def test_register_with_token_preserves_http_status(
+        self, unauthed_async_client, aioresponse, fail_step
+    ):
+        if fail_step == 2:
+            aioresponse.post(
+                f"{BASE_URL_V3}/register",
+                status=401,
+                payload={
+                    "session": "abc1234",
+                    "flows": [
+                        {"stages": ["m.login.registration_token", "m.login.dummy"]}
+                    ],
+                    "params": {},
+                },
+            )
+        aioresponse.post(
+            f"{BASE_URL_V3}/register",
+            status=503,
+            payload={"errcode": "M_UNKNOWN", "error": "temporarily unavailable"},
+        )
+
+        resp = await unauthed_async_client.register_with_token(
+            "user", "password", "token"
+        )
+
+        assert isinstance(resp, RegisterErrorResponse)
+        assert resp.status_code == "M_UNKNOWN"
+        assert resp.http_status == 503
 
     async def test_register_with_token(self, unauthed_async_client, aioresponse):
         assert not unauthed_async_client.access_token
@@ -1920,6 +1955,76 @@ class TestClass:
 
         assert isinstance(resp, RoomGetStateEventResponse)
 
+    @pytest.mark.parametrize(
+        ("http_status", "errcode"),
+        [
+            (404, "M_NOT_FOUND"),
+            (503, "M_NOT_FOUND"),
+            (403, "M_FORBIDDEN"),
+        ],
+    )
+    async def test_room_get_state_event_error(
+        self, async_client, aioresponse, http_status, errcode
+    ):
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.name",
+            status=http_status,
+            payload={"errcode": errcode, "error": "request failed"},
+        )
+
+        resp = await async_client.room_get_state_event(
+            room_id=TEST_ROOM_ID, event_type="m.room.name", state_key=""
+        )
+
+        assert isinstance(resp, RoomGetStateEventError)
+        assert resp.status_code == errcode
+        assert resp.http_status == http_status
+        assert resp.room_id == TEST_ROOM_ID
+
+    async def test_room_get_state_event_non_json_error(self, async_client, aioresponse):
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.name",
+            status=502,
+            body="<html>bad gateway</html>",
+            content_type="text/html",
+        )
+
+        resp = await async_client.room_get_state_event(
+            room_id=TEST_ROOM_ID, event_type="m.room.name", state_key=""
+        )
+
+        assert isinstance(resp, RoomGetStateEventError)
+        assert resp.http_status == 502
+        assert resp.room_id == TEST_ROOM_ID
+
+    @pytest.mark.parametrize(
+        ("http_status", "errcode"),
+        [
+            (503, "M_FORBIDDEN"),
+            (403, "M_FORBIDDEN"),
+        ],
+    )
+    async def test_room_put_state_error_http_status(
+        self, async_client, aioresponse, http_status, errcode
+    ):
+        aioresponse.put(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/org.example.event_type",
+            status=http_status,
+            payload={"errcode": errcode, "error": "cannot write state"},
+        )
+
+        resp = await async_client.room_put_state(
+            room_id=TEST_ROOM_ID,
+            event_type="org.example.event_type",
+            content={},
+            state_key="",
+        )
+
+        assert isinstance(resp, RoomPutStateError)
+        assert resp.status_code == errcode
+        assert resp.http_status == http_status
+        assert resp.room_id == TEST_ROOM_ID
+
     async def test_room_get_state(self, async_client, aioresponse):
         aioresponse.get(
             f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state",
@@ -2625,6 +2730,7 @@ class TestClass:
         assert isinstance(resp, RoomSendEphemeralError)
         assert resp.message == f"HTTP {status}"
         assert resp.room_id == TEST_ROOM_ID
+        assert resp.http_status == status
         assert resp.transport_response.status == status
 
     async def test_update_receipt_marker(self, async_client: AsyncClient, aioresponse):
@@ -6006,6 +6112,67 @@ class TestClass:
         assert len(aioresponse.requests) == 1
         assert all(method == "GET" for method, _url in aioresponse.requests)
 
+    @pytest.mark.parametrize("helper", ["has_event_permission", "has_permission"])
+    async def test_permission_helpers_return_power_levels_get_error(
+        self, async_client, aioresponse, helper
+    ):
+        room_create_event = RoomCreateEvent.from_dict(
+            {
+                "content": {"creator": "@other:example.org", "room_version": "10"},
+                "event_id": "$create_event_id",
+                "origin_server_ts": 1000,
+                "sender": "@other:example.org",
+                "state_key": "",
+                "type": "m.room.create",
+            }
+        )
+        await async_client.receive_response(
+            SyncResponse(
+                next_batch="sync_next_batch",
+                rooms=Rooms(
+                    invite={},
+                    join={
+                        TEST_ROOM_ID: RoomInfo(
+                            timeline=Timeline(
+                                events=[], limited=False, prev_batch="room_prev_batch"
+                            ),
+                            state=[room_create_event],
+                            ephemeral=[],
+                            account_data=[],
+                        )
+                    },
+                    leave={},
+                ),
+                device_key_count=DeviceOneTimeKeyCount(
+                    curve25519=None, signed_curve25519=None
+                ),
+                device_list=DeviceList(changed=[], left=[]),
+                to_device_events=[],
+                presence_events=[],
+            )
+        )
+        aioresponse.get(
+            f"{BASE_URL_V3}/account/whoami",
+            status=200,
+            payload={"user_id": ALICE_ID},
+        )
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.power_levels",
+            status=503,
+            payload={"errcode": "M_UNKNOWN", "error": "backend unavailable"},
+        )
+
+        if helper == "has_event_permission":
+            response = await async_client.has_event_permission(
+                TEST_ROOM_ID, "m.room.tombstone", "state"
+            )
+        else:
+            response = await async_client.has_permission(TEST_ROOM_ID, "kick")
+
+        assert isinstance(response, RoomGetStateEventError)
+        assert response.http_status == 503
+        assert response.status_code == "M_UNKNOWN"
+
     async def test_has_permission__roomv12_creator_does(
         self, async_client, aioresponse
     ):
@@ -6294,3 +6461,163 @@ class TestClass:
         assert not any(
             method in {"POST", "PUT", "DELETE"} for method, _url in aioresponse.requests
         )
+
+    async def test_room_update_aliases_aborts_on_non_404_get_error(
+        self, async_client, aioresponse
+    ):
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
+            status=503,
+            payload={"errcode": "M_FORBIDDEN", "error": "transient refusal"},
+        )
+
+        resp = await async_client.room_update_aliases(TEST_ROOM_ID)
+
+        assert isinstance(resp, RoomUpdateAliasError)
+        assert resp.http_status == 503
+        assert resp.status_code == "M_FORBIDDEN"
+        assert not any(
+            method in {"PUT", "DELETE"} for method, _url in aioresponse.requests
+        )
+
+    @pytest.mark.parametrize("failed_read", ["old-room", "old-room-nested", "new-room"])
+    async def test_room_upgrade_returns_error_on_alias_failure(
+        self, async_client, aioresponse, failed_read
+    ):
+        room_create_event_dict = {
+            "content": {"creator": ALICE_ID, "room_version": "10"},
+            "event_id": "$create_event_id",
+            "origin_server_ts": 1000,
+            "sender": ALICE_ID,
+            "state_key": "",
+            "type": "m.room.create",
+        }
+        power_levels_event_dict = {
+            "content": {"users": {ALICE_ID: 100}},
+            "event_id": "$power_levels_event_id",
+            "origin_server_ts": 1001,
+            "sender": ALICE_ID,
+            "state_key": "",
+            "type": "m.room.power_levels",
+        }
+        await async_client.receive_response(
+            SyncResponse(
+                next_batch="sync_next_batch",
+                rooms=Rooms(
+                    invite={},
+                    join={
+                        TEST_ROOM_ID: RoomInfo(
+                            timeline=Timeline(
+                                events=[], limited=False, prev_batch="room_prev_batch"
+                            ),
+                            state=[
+                                RoomCreateEvent.from_dict(room_create_event_dict),
+                                PowerLevelsEvent.from_dict(power_levels_event_dict),
+                            ],
+                            ephemeral=[],
+                            account_data=[],
+                        )
+                    },
+                    leave={},
+                ),
+                device_key_count=DeviceOneTimeKeyCount(
+                    curve25519=None, signed_curve25519=None
+                ),
+                device_list=DeviceList(changed=[], left=[]),
+                to_device_events=[],
+                presence_events=[],
+            )
+        )
+        aioresponse.get(
+            f"{BASE_URL_V3}/account/whoami",
+            status=200,
+            payload={"user_id": ALICE_ID},
+            repeat=True,
+        )
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.power_levels",
+            status=200,
+            payload=power_levels_event_dict["content"],
+            repeat=True,
+        )
+        aioresponse.get(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state",
+            status=200,
+            payload=[room_create_event_dict, power_levels_event_dict],
+            repeat=True,
+        )
+        new_room_id = "!new:example.org"
+        aioresponse.post(
+            f"{BASE_URL_V3}/createRoom",
+            status=200,
+            payload=self.room_id_response(new_room_id),
+        )
+        aioresponse.put(
+            f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.tombstone",
+            status=200,
+            payload={"event_id": "$tombstone_event_id"},
+        )
+        unavailable = {"errcode": "M_FORBIDDEN", "error": "backend unavailable"}
+        if failed_read == "old-room":
+            aioresponse.get(
+                f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
+                status=503,
+                payload=unavailable,
+            )
+        elif failed_read == "old-room-nested":
+            # The upgrade reads the old alias, then the alias update's own read fails.
+            aioresponse.get(
+                f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
+                status=200,
+                payload={"alias": "#old:example.org"},
+            )
+            aioresponse.get(
+                f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
+                status=503,
+                payload=unavailable,
+            )
+        else:
+            # The old room's aliases move away, then reading the new room's fails.
+            aioresponse.get(
+                f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
+                status=200,
+                payload={"alias": "#old:example.org"},
+                repeat=True,
+            )
+            aioresponse.delete(
+                f"{BASE_URL_V3}/directory/room/%23old%3Aexample.org",
+                status=200,
+                payload={},
+            )
+            aioresponse.put(
+                f"{BASE_URL_V3}/rooms/{TEST_ROOM_ID}/state/m.room.canonical_alias",
+                status=200,
+                payload={"event_id": "$alias_event_id"},
+            )
+            aioresponse.get(
+                f"{BASE_URL_V3}/rooms/{new_room_id}/state/m.room.canonical_alias",
+                status=503,
+                payload=unavailable,
+            )
+
+        response = await async_client.room_upgrade(TEST_ROOM_ID, "12")
+
+        assert isinstance(response, RoomUpgradeError)
+        assert response.http_status == 503
+
+
+def test_error_response_http_status_default_and_positional_args():
+    hand_built = ErrorResponse("boom", "M_UNKNOWN")
+    assert hand_built.http_status is None
+
+    explicit = RoomGetStateEventError(
+        "x", "M_NOT_FOUND", room_id=TEST_ROOM_ID, http_status=404
+    )
+    assert explicit.room_id == TEST_ROOM_ID
+    assert explicit.http_status == 404
+
+    parsed = _ErrorWithRoomId.from_dict(
+        {"errcode": "M_FORBIDDEN", "error": "denied"}, TEST_ROOM_ID
+    )
+    assert parsed.room_id == TEST_ROOM_ID
+    assert parsed.http_status is None

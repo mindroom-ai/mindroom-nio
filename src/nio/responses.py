@@ -529,10 +529,13 @@ class DiskFileResponse(FileResponse):
 
 @dataclass
 class ErrorResponse(Response):
+    """Error response; ``http_status`` is the HTTP status it was parsed from, or ``None`` if built by hand."""
+
     message: str = field()
     status_code: str | None = None
     retry_after_ms: int | None = None
     soft_logout: bool = False
+    http_status: int | None = field(default=None, kw_only=True)
 
     def __str__(self) -> str:
         if self.status_code and self.message:
@@ -573,7 +576,7 @@ class _ErrorWithRoomId(ErrorResponse):
         try:
             validate_json(parsed_dict, Schemas.error)
         except (SchemaError, ValidationError):
-            return cls("unknown error")
+            return cls("unknown error", room_id=room_id)
 
         return cls(
             parsed_dict["error"],

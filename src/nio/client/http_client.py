@@ -48,6 +48,7 @@ from ..responses import (
     DeleteDevicesResponse,
     DevicesResponse,
     DownloadResponse,
+    ErrorResponse,
     FileResponse,
     JoinedMembersResponse,
     JoinResponse,
@@ -1205,6 +1206,8 @@ class HttpClient(Client):
         response.end_time = transport_response.receive_time
         response.timeout = transport_response.timeout
         response.status_code = transport_response.status_code
+        if isinstance(response, ErrorResponse):
+            response.http_status = transport_response.status_code
         response.uuid = transport_response.uuid
 
         return response

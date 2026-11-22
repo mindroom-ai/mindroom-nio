@@ -342,6 +342,7 @@ async def test_public_member_query_returns_error_without_reusing_recipients(
             result = await nio_client.joined_members(ROOM)
             assert isinstance(result, JoinedMembersError)
             assert result.status_code == errcode
+            assert result.http_status == status
             assert result.room_id == ROOM
             assert str(status) in result.message
             assert set(room.users) == {USER}

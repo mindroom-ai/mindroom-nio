@@ -14,6 +14,7 @@ class TestClass:
         client.receive(transport_response)
         response = client.next_response()
         assert response.status_code == 503
+        assert response.http_status == 503
 
     def test_502(self):
         client = HttpClient("localhost", "example")
@@ -23,3 +24,4 @@ class TestClass:
         client.receive(transport_response)
         response = client.next_response()
         assert response.status_code == 502
+        assert response.http_status == 502
