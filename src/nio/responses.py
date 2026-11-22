@@ -576,7 +576,7 @@ class _ErrorWithRoomId(ErrorResponse):
         try:
             validate_json(parsed_dict, Schemas.error)
         except (SchemaError, ValidationError):
-            return cls("unknown error")
+            return cls("unknown error", room_id=room_id)
 
         return cls(
             parsed_dict["error"],

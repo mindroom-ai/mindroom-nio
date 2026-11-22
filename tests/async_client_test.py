@@ -1995,6 +1995,7 @@ class TestClass:
 
         assert isinstance(resp, RoomGetStateEventError)
         assert resp.http_status == 502
+        assert resp.room_id == TEST_ROOM_ID
 
     @pytest.mark.parametrize(
         ("http_status", "errcode"),
